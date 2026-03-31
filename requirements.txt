@@ -1,0 +1,7 @@
+pandas
+yfinance
+matplotlib
+python-dotenv
+sec-api
+google-generativeai
+

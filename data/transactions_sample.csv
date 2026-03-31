@@ -1,0 +1,34 @@
+date,type,asset,ticker,price,quantity,amount,description
+2025-08-05,investment,Apple Inc,AAPL,180,10,-1800,Initial buy AAPL
+2025-09-10,investment,Apple Inc,AAPL,185,5,-925,Add AAPL
+2026-02-12,investment,Apple Inc,AAPL,210,-3,630,Partial sell AAPL
+
+2025-08-15,investment,NVIDIA Corp,NVDA,120,15,-1800,Initial buy NVDA
+2025-10-20,investment,NVIDIA Corp,NVDA,135,5,-675,Add NVDA
+2026-01-18,investment,NVIDIA Corp,NVDA,150,-4,600,Partial sell NVDA
+
+2025-09-01,investment,Microsoft Corp,MSFT,330,8,-2640,Initial buy MSFT
+2025-11-15,investment,Microsoft Corp,MSFT,350,2,-700,Add MSFT
+
+2025-09-25,investment,Amazon.com Inc,AMZN,140,12,-1680,Initial buy AMZN
+2026-03-10,investment,Amazon.com Inc,AMZN,160,4,-640,Add AMZN
+
+2025-10-05,investment,Alphabet Inc,GOOGL,135,10,-1350,Initial buy GOOGL
+2026-02-20,investment,Alphabet Inc,GOOGL,150,3,-450,Add GOOGL
+
+2025-10-18,investment,Meta Platforms Inc,META,300,6,-1800,Initial buy META
+2026-01-25,investment,Meta Platforms Inc,META,330,2,-660,Add META
+
+2025-11-01,investment,Tesla Inc,TSLA,250,5,-1250,Initial buy TSLA
+2026-02-05,investment,Tesla Inc,TSLA,280,-2,560,Partial sell TSLA
+
+2025-11-20,investment,SPDR S&P 500 ETF,SPY,460,4,-1840,Initial buy SPY
+2026-03-01,investment,SPDR S&P 500 ETF,SPY,480,2,-960,Add SPY
+
+2025-12-01,investment,Invesco QQQ Trust,QQQ,390,3,-1170,Initial buy QQQ
+2026-03-15,investment,Invesco QQQ Trust,QQQ,420,1,-420,Add QQQ
+
+2025-12-10,expense,,,-,,-120,Groceries
+2026-01-05,income,,,-,,2500,Monthly allowance
+2026-02-01,income,,,-,,2600,Internship salary
+
