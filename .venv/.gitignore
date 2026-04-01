@@ -1,0 +1,18 @@
+# Python bytecode (Junk)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment (Giant folder we don't need to save)
+.venv/
+venv/
+env/
+
+# SECRETS (MOST IMPORTANT)
+.env
+
+# Large Data (Optional - prevents Git from getting slow)
+data/raw_filings/
+
+# macOS system files
+.DS_Store
