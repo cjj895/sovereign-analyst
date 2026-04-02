@@ -1,0 +1,38 @@
+---
+description: Core project context and non-negotiable rules for Sovereign Analyst
+alwaysApply: true
+---
+
+# Sovereign Analyst — Project Context
+
+A personal finance and investment research tool. It tracks an equity portfolio,
+calculates performance metrics, and downloads SEC filings for fundamental analysis.
+
+## Architecture
+
+| File | Role |
+|------|------|
+| `core/portfolio_engine.py` | Central engine — all portfolio logic lives here |
+| `scripts/fetch_filings.py` | SEC EDGAR downloader — fetches and saves 10-K filings |
+| `data/transactions_sample.csv` | Source of truth for all trades and income |
+| `data/.price_cache.json` | 15-minute yfinance price cache — never commit this |
+| `data/raw_filings/` | Downloaded SEC 10-K text files |
+
+## Absolute Non-Negotiables
+
+- **Never hardcode credentials.** API keys, User Agents, and secrets go in `.env` only.
+- **Never use the system Python.** Always run via `.venv` (Python 3.14+).
+- **Never bypass ACB.** All cost basis calculations must use the Average Cost Basis method in chronological order. Do not simplify to a plain average.
+- **Never skip validation.** Every pipeline run must execute `run_validations()`. Do not remove or comment it out.
+
+## Transaction Types (CSV Contract)
+
+| type | Cash | Quantity | Accounting |
+|------|------|----------|------------|
+| `buy` | decreases | increases | grows cost basis |
+| `sell` | increases | decreases | records realised P/L via ACB |
+| `dividend` | increases | unchanged | tracked separately, not in cost basis |
+| `income` | increases | N/A | non-investment cash flow |
+| `expense` | decreases | N/A | non-investment cash flow |
+
+Quantity is always a positive number. Direction is inferred from the `type` column.

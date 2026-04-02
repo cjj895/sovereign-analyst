@@ -1,0 +1,52 @@
+---
+description: Rules for SQLite database usage and TransactionStore
+globs: core/database.py
+alwaysApply: false
+---
+
+# Database Rules
+
+## Source of Truth
+
+`data/sovereign.db` is the single source of truth for all transactions.
+The CSV (`data/transactions_sample.csv`) is a **seed file only** — it is imported
+once on first run via `seed_from_csv()` and never read again after that.
+
+Do not reintroduce `pd.read_csv()` calls in `PortfolioManager.load_transactions()`.
+
+## Adding Transactions
+
+All new trades must go through `TransactionStore.add_transaction()` or
+`PortfolioManager.add_transaction()`. Never INSERT directly with raw SQL
+outside of `TransactionStore`.
+
+```python
+# ✅ CORRECT
+pm.add_transaction("2026-04-01", "buy", "Apple Inc", "AAPL",
+                   price=172.50, quantity=5, amount=-862.50)
+
+# ❌ WRONG — bypasses null handling and type normalisation
+conn.execute("INSERT INTO transactions VALUES (...)")
+```
+
+## Schema Contract
+
+| column     | type    | notes |
+|------------|---------|-------|
+| date       | TEXT    | ISO-8601 e.g. "2025-08-05" |
+| type       | TEXT    | always lowercase: buy/sell/dividend/income/expense |
+| quantity   | REAL    | always positive — direction implied by type |
+| amount     | REAL    | signed cash impact (negative = outflow) |
+
+Never rename these columns — `load_transactions()` maps them directly to
+the pandas DataFrame schema expected by `PortfolioManager`.
+
+## NULL Handling
+
+Use `TransactionStore._null()` to convert NaN, empty strings, and "nan"
+strings to Python `None` before any INSERT. SQLite stores `None` as NULL.
+
+## WAL Mode
+
+The database always opens with `PRAGMA journal_mode = WAL`.
+Do not change this — it allows safe concurrent reads during pipeline runs.

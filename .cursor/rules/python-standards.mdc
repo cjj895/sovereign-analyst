@@ -1,0 +1,69 @@
+---
+description: Python coding standards for all files in this project
+globs: **/*.py
+alwaysApply: false
+---
+
+# Python Standards
+
+## Type Hints
+
+All function signatures must have type hints for parameters and return values.
+
+```python
+# ✅ CORRECT
+def get_live_prices(self, tickers: list[str]) -> list[float | None]:
+
+# ❌ WRONG
+def get_live_prices(self, tickers):
+```
+
+## File Paths — Always Use pathlib
+
+```python
+# ✅ CORRECT
+from pathlib import Path
+path = Path("data/transactions_sample.csv")
+
+# ❌ WRONG
+path = "data/transactions_sample.csv"
+```
+
+## Static Utilities
+
+If a method does not use `self`, decorate it with `@staticmethod`.
+
+```python
+# ✅ CORRECT
+@staticmethod
+def _format_file_size(size_bytes: int) -> str:
+    ...
+```
+
+## Error Handling
+
+Never swallow exceptions silently. At minimum, return a safe fallback value
+and let the caller decide:
+
+```python
+# ✅ CORRECT — return None, caller handles it
+except Exception:
+    prices.append(entry.get("price"))   # stale fallback
+
+# ❌ WRONG — silent pass hides bugs
+except Exception:
+    pass
+```
+
+## Secrets
+
+Credentials and environment-specific values come from `.env` via `python-dotenv`.
+Never hardcode them as string literals.
+
+```python
+# ✅ CORRECT
+user_agent = os.getenv("USER_AGENT")
+
+# ❌ WRONG
+user_agent = "John Smith john@email.com"
+```

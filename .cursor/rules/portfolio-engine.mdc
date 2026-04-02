@@ -1,0 +1,53 @@
+---
+description: Rules for editing the PortfolioManager class and its methods
+globs: core/portfolio_engine.py
+alwaysApply: false
+---
+
+# Portfolio Engine Rules
+
+## Average Cost Basis (ACB) — Must Preserve
+
+`calculate_holdings()` walks transactions in date order. Do not refactor this
+into a groupby or vectorised operation — the chronological order is load-bearing.
+
+```python
+# ✅ CORRECT — sell reduces cost proportionally using running avg_cost
+avg_cost = lots[ticker]["total_cost"] / current_qty
+realised_pnl += (sell_price - avg_cost) * qty_sold
+lots[ticker]["total_cost"] -= avg_cost * qty_sold
+
+# ❌ WRONG — recalculating avg from raw data ignores prior sells
+avg_cost = investment_df[investment_df["ticker"] == t]["amount"].sum() / total_qty
+```
+
+## Price Caching — Must Preserve
+
+All yfinance calls go through `get_live_prices()`. Never call `yf.Ticker()` directly
+from any other method. The 15-minute TTL is enforced by `_is_cache_fresh()`.
+
+```python
+# ✅ CORRECT
+prices = self.get_live_prices(tickers)
+
+# ❌ WRONG — bypasses cache
+price = yf.Ticker(ticker).fast_info.last_price
+```
+
+Use attribute access on `fast_info`, not dictionary access:
+```python
+# ✅  fast_info.last_price
+# ❌  fast_info["last_price"]   ← broken in yfinance 1.2+
+```
+
+## Portfolio Metrics
+
+`compute_portfolio_metrics()` must always return these five columns:
+`total_capital_invested`, `total_market_value`, `total_unrealised_pnl`,
+`total_realised_pnl`, `total_dividends`. Do not remove or rename them —
+`add_snapshot()` and the snapshot header depend on this schema.
+
+## Validation
+
+`run_validations()` must be called at the end of every `run_pipeline()` call.
+All four checks must pass before the result is returned to the caller.

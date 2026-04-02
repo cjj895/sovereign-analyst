@@ -1,0 +1,48 @@
+---
+description: Rules for SEC EDGAR filing downloads and validation
+globs: scripts/fetch_filings.py
+alwaysApply: false
+---
+
+# SEC Filings Rules
+
+## Environment
+
+`fetch_filings.py` requires a `.env` file at the project root containing:
+```
+USER_AGENT=Your Full Name (your@email.com)
+```
+This is required by the SEC EDGAR Fair Access policy. Never hardcode it.
+
+## File Validation — Always Run After Download
+
+Every downloaded filing must be passed through `validate_filing()` from
+`PortfolioManager` before it is used for analysis.
+
+```python
+# ✅ CORRECT — validate immediately after fetch
+path = fetch_latest_10k(ticker)
+result = pm.validate_filing(path)
+if not result["is_valid"]:
+    raise ValueError(f"Suspicious download for {ticker}: {result['status']}")
+```
+
+Minimum valid file size is **10 KB** (`MIN_FILING_SIZE_BYTES = 10_240`).
+A real 10-K is typically 5–50 MB. Anything smaller is likely an SEC error page.
+
+## File Naming Convention
+
+Saved filings follow this pattern and must not be changed:
+```
+data/raw_filings/{TICKER}_10-K_{YYYY-MM-DD}.txt
+```
+
+The `sanitize_filename()` function must be applied to both the ticker and date
+before constructing the path to prevent invalid characters in filenames.
+
+## API Behaviour
+
+- All SEC requests must include the `User-Agent` header.
+- Use a 30-second timeout on all requests.
+- The CIK must be zero-padded to 10 digits for submissions URL lookups.
+- The accession number must have dashes removed for the archive URL.

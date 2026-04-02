@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Database and Personal Data
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/portfolio_history.csv
+data/transactions_sample.csv
+
+# Cache and Temporary Files
+data/.price_cache.json
+data/.split_cache.json
+.DS_Store
+
+# SEC Filings (can be large, better to download fresh)
+data/raw_filings/
+
+# Environment Variables
+.env
