@@ -7,9 +7,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import matplotlib.pyplot as plt
 import pandas as pd
 import yfinance as yf
+
+from core.database import FilingMetadataStore, SignalStore
 
 
 @dataclass
@@ -55,6 +56,7 @@ class PortfolioManager:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.config.db_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode = WAL")
         return conn
 
     # ------------------------------------------------------------------ #
@@ -230,7 +232,6 @@ class PortfolioManager:
             ticker, 10-K (list of paths), 10-Q (list of paths)
         """
         from scripts.fetch_filings import fetch_filings_for_ticker, load_environment, get_user_agent
-        from core.database import FilingMetadataStore
 
         load_environment()
         user_agent = get_user_agent()
@@ -265,11 +266,9 @@ class PortfolioManager:
         Return a DataFrame of all filings logged in the DB.
         Optionally filter by ticker.
         """
-        from core.database import FilingMetadataStore
         store = FilingMetadataStore(self.config.db_path)
         if ticker:
             rows = store.get_filings_for_ticker(ticker.upper())
-            import pandas as pd
             return pd.DataFrame(rows) if rows else pd.DataFrame()
         return store.get_all_filings()
 
@@ -299,27 +298,29 @@ class PortfolioManager:
             transcripts         list[dict]  — latest 5 transcript signals (parsed JSON)
             generated_at        str  ISO-8601 timestamp of when this view was built
         """
-        import json as _json
-        from core.database import FilingMetadataStore, SignalStore
-
         ticker = ticker.upper()
 
-        # -- 1. Position data from live pipeline --
-        pipeline = self.run_pipeline()
-        holdings = pipeline.get("holdings")
+        # -- 1. Position data — compute only the requested ticker, not all holdings --
+        holdings_df, _, _ = self.recalculate_portfolio()
         position: dict[str, Any] | None = None
-        if holdings is not None and not holdings.empty and ticker in holdings.index:
-            row = holdings.loc[ticker]
+        if not holdings_df.empty and ticker in holdings_df.index:
+            prices = self.get_live_prices([ticker])
+            current_price = prices.get(ticker)
+            row = holdings_df.loc[ticker]
+            capital = float(row.get("capital_invested", 0) or 0)
+            qty = float(row.get("quantity", 0) or 0)
+            market_val = qty * current_price if current_price else None
+            unrealised = (market_val - capital) if market_val is not None else None
             position = {
-                "quantity":          row.get("quantity"),
-                "avg_cost":          row.get("avg_cost"),
-                "capital_invested":  row.get("capital_invested"),
-                "current_price":     row.get("current_price"),
-                "market_value":      row.get("market_value"),
-                "unrealised_pnl":    row.get("unrealised_pnl"),
+                "quantity":           qty,
+                "avg_cost":           float(row.get("avg_cost", 0) or 0),
+                "capital_invested":   capital,
+                "current_price":      current_price,
+                "market_value":       market_val,
+                "unrealised_pnl":     unrealised,
                 "unrealised_pnl_pct": (
-                    round(row["unrealised_pnl"] / row["capital_invested"] * 100, 2)
-                    if row.get("capital_invested") else None
+                    round(unrealised / capital * 100, 2)
+                    if unrealised is not None and capital else None
                 ),
             }
 
@@ -338,8 +339,8 @@ class PortfolioManager:
             parsed = []
             for s in raw:
                 try:
-                    payload = _json.loads(s["content"])
-                except (_json.JSONDecodeError, KeyError):
+                    payload = json.loads(s["content"])
+                except (json.JSONDecodeError, KeyError):
                     payload = {"raw": s.get("content", "")}
                 parsed.append({
                     "timestamp": s["timestamp"],

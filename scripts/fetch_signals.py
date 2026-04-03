@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import yfinance as yf
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -127,7 +128,7 @@ def fetch_transcript_signals_for_ticker(
 
         for ed in earnings_dates[:2]:  # at most 2 (prev + next)
             try:
-                ts = pd.Timestamp(ed) if not isinstance(ed, str) else pd.Timestamp(ed)
+                ts = pd.Timestamp(ed)
                 ts_iso = ts.isoformat()
                 external_id = f"earnings_date_{ticker.upper()}_{ts_iso}"
                 content = json.dumps({
@@ -254,5 +255,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    import pandas as pd
     main()
