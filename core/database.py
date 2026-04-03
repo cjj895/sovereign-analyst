@@ -6,6 +6,9 @@ from typing import Any
 
 import pandas as pd
 
+# Shared database path used by both stores
+DEFAULT_DB_PATH = Path("data/sovereign.db")
+
 
 class TransactionStore:
     """
@@ -261,3 +264,272 @@ class TransactionStore:
             conn.executemany(sql, rows)
 
         return len(rows)
+
+
+class FilingMetadataStore:
+    """
+    SQLite-backed store for SEC filing download records.
+
+    Operates on the same data/sovereign.db as TransactionStore.
+
+    Schema
+    ------
+    filings_metadata
+        accession_number  TEXT  PK   Unique SEC identifier e.g. "0000320193-24-000123"
+        ticker            TEXT       Exchange symbol e.g. "AAPL"
+        cik               TEXT       10-digit Central Index Key
+        form_type         TEXT       "10-K" or "10-Q"
+        filing_date       TEXT       Date filed with the SEC (ISO-8601)
+        period_of_report  TEXT       Financial period end date (ISO-8601)
+        local_path        TEXT       Absolute path to the saved .txt file
+        file_size_bytes   INTEGER    Byte count of the downloaded file
+        created_at        TEXT       UTC timestamp of when the record was inserted
+    """
+
+    _SCHEMA = """
+    CREATE TABLE IF NOT EXISTS filings_metadata (
+        accession_number  TEXT    PRIMARY KEY,
+        ticker            TEXT    NOT NULL,
+        cik               TEXT    NOT NULL,
+        form_type         TEXT    NOT NULL,
+        filing_date       TEXT    NOT NULL,
+        period_of_report  TEXT    NOT NULL,
+        local_path        TEXT    NOT NULL,
+        file_size_bytes   INTEGER NOT NULL,
+        created_at        TEXT    DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_fm_ticker    ON filings_metadata (ticker);
+    CREATE INDEX IF NOT EXISTS idx_fm_form_type ON filings_metadata (form_type);
+    CREATE INDEX IF NOT EXISTS idx_fm_period    ON filings_metadata (period_of_report);
+    """
+
+    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode = WAL")
+        return conn
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            conn.executescript(self._SCHEMA)
+
+    # ------------------------------------------------------------------ #
+    #  Queries                                                            #
+    # ------------------------------------------------------------------ #
+
+    def filing_exists(self, accession_number: str) -> bool:
+        """Return True if a filing record already exists for this accession number."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM filings_metadata WHERE accession_number = ?",
+                (accession_number,),
+            ).fetchone()
+        return row is not None
+
+    def get_filings_for_ticker(
+        self,
+        ticker: str,
+        form_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Return all downloaded filings for a ticker, newest first.
+        Optionally filter by form_type ("10-K" or "10-Q").
+        """
+        sql = (
+            "SELECT * FROM filings_metadata WHERE ticker = ?"
+            + (" AND form_type = ?" if form_type else "")
+            + " ORDER BY period_of_report DESC"
+        )
+        params = (ticker.upper(), form_type) if form_type else (ticker.upper(),)
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_all_filings(self) -> pd.DataFrame:
+        """Return all filing records as a DataFrame sorted by period descending."""
+        with self._connect() as conn:
+            return pd.read_sql_query(
+                "SELECT * FROM filings_metadata ORDER BY period_of_report DESC",
+                conn,
+            )
+
+    # ------------------------------------------------------------------ #
+    #  Writes                                                             #
+    # ------------------------------------------------------------------ #
+
+    def log_filing(
+        self,
+        accession_number: str,
+        ticker: str,
+        cik: str,
+        form_type: str,
+        filing_date: str,
+        period_of_report: str,
+        local_path: str | Path,
+        file_size_bytes: int,
+    ) -> bool:
+        """
+        Insert a filing record. Skips silently if the accession_number already exists.
+        Returns True if a new row was inserted, False if it was a duplicate.
+        """
+        if self.filing_exists(accession_number):
+            return False
+
+        sql = """
+        INSERT INTO filings_metadata
+            (accession_number, ticker, cik, form_type, filing_date, period_of_report,
+             local_path, file_size_bytes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        with self._connect() as conn:
+            conn.execute(sql, (
+                accession_number,
+                ticker.upper(),
+                cik,
+                form_type,
+                filing_date,
+                period_of_report,
+                str(local_path),
+                file_size_bytes,
+            ))
+        return True
+
+
+class SignalStore:
+    """
+    SQLite-backed store for market signals: news headlines and transcript events.
+
+    Operates on the same data/sovereign.db as TransactionStore and FilingMetadataStore.
+
+    Schema
+    ------
+    signals
+        id           INTEGER  PK AUTOINCREMENT
+        ticker       TEXT     Exchange symbol  e.g. "AAPL"
+        type         TEXT     "news" or "transcript"
+        content      TEXT     JSON string: {title, link, publisher} for news;
+                              {earnings_date, link} for transcript events
+        timestamp    TEXT     ISO-8601 publish/event datetime
+        external_id  TEXT     Unique yfinance UUID — prevents duplicate inserts
+        created_at   TEXT     UTC timestamp of when the record was inserted
+    """
+
+    _SCHEMA = """
+    CREATE TABLE IF NOT EXISTS signals (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker      TEXT    NOT NULL,
+        type        TEXT    NOT NULL,
+        content     TEXT    NOT NULL,
+        timestamp   TEXT    NOT NULL,
+        external_id TEXT    UNIQUE,
+        created_at  TEXT    DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_sig_ticker    ON signals (ticker);
+    CREATE INDEX IF NOT EXISTS idx_sig_type      ON signals (type);
+    CREATE INDEX IF NOT EXISTS idx_sig_timestamp ON signals (timestamp);
+    """
+
+    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode = WAL")
+        return conn
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            conn.executescript(self._SCHEMA)
+
+    # ------------------------------------------------------------------ #
+    #  Queries                                                            #
+    # ------------------------------------------------------------------ #
+
+    def signal_exists(self, external_id: str) -> bool:
+        """Return True if a signal with this external_id already exists."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM signals WHERE external_id = ?", (external_id,)
+            ).fetchone()
+        return row is not None
+
+    def get_signals_for_ticker(
+        self,
+        ticker: str,
+        signal_type: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """
+        Return the most recent signals for a ticker, newest first.
+        Optionally filter by signal_type ("news" or "transcript").
+        """
+        sql = (
+            "SELECT * FROM signals WHERE ticker = ?"
+            + (" AND type = ?" if signal_type else "")
+            + " ORDER BY timestamp DESC LIMIT ?"
+        )
+        params = (
+            (ticker.upper(), signal_type, limit)
+            if signal_type
+            else (ticker.upper(), limit)
+        )
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_all_signals(self) -> pd.DataFrame:
+        """Return all signals as a DataFrame sorted by timestamp descending."""
+        with self._connect() as conn:
+            return pd.read_sql_query(
+                "SELECT * FROM signals ORDER BY timestamp DESC", conn
+            )
+
+    # ------------------------------------------------------------------ #
+    #  Writes                                                             #
+    # ------------------------------------------------------------------ #
+
+    def log_signal(
+        self,
+        ticker: str,
+        signal_type: str,
+        content: str,
+        timestamp: str,
+        external_id: str | None = None,
+    ) -> bool:
+        """
+        Insert a signal record. Skips silently if external_id already exists.
+        Returns True if a new row was inserted, False if it was a duplicate.
+
+        Parameters
+        ----------
+        ticker      : Exchange symbol e.g. "AAPL"
+        signal_type : "news" or "transcript"
+        content     : JSON string with the signal payload
+        timestamp   : ISO-8601 datetime of the event
+        external_id : Unique identifier from the source (yfinance UUID) to
+                      prevent duplicate inserts across runs
+        """
+        if external_id and self.signal_exists(external_id):
+            return False
+
+        sql = """
+        INSERT INTO signals (ticker, type, content, timestamp, external_id)
+        VALUES (?, ?, ?, ?, ?)
+        """
+        with self._connect() as conn:
+            conn.execute(sql, (
+                ticker.upper(),
+                signal_type,
+                content,
+                timestamp,
+                external_id,
+            ))
+        return True

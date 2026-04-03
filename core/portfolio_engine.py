@@ -209,6 +209,153 @@ class PortfolioManager:
         if updated: self._save_price_cache(cache)
         return prices
 
+    # ------------------------------------------------------------------ #
+    #  Filings                                                           #
+    # ------------------------------------------------------------------ #
+
+    def fetch_filings_for_top_holdings(
+        self,
+        n_holdings: int = 5,
+        n_quarterly: int = 4,
+    ) -> list[dict[str, Any]]:
+        """
+        For the top n_holdings positions by market value, download:
+            - 1 latest 10-K annual report
+            - Last n_quarterly 10-Q quarterly reports
+
+        Each download is validated (size >= 10 KB + contains Table of Contents)
+        and logged to the filings_metadata table on success.
+
+        Returns a list of result dicts — one per ticker — with keys:
+            ticker, 10-K (list of paths), 10-Q (list of paths)
+        """
+        from scripts.fetch_filings import fetch_filings_for_ticker, load_environment, get_user_agent
+        from core.database import FilingMetadataStore
+
+        load_environment()
+        user_agent = get_user_agent()
+        store = FilingMetadataStore(self.config.db_path)
+
+        result = self.run_pipeline()
+        holdings = result["holdings"]
+        if holdings.empty:
+            return []
+
+        top_tickers: list[str] = (
+            holdings.sort_values("market_value", ascending=False)
+            .head(n_holdings)
+            .index.tolist()
+        )
+
+        output = []
+        for ticker in top_tickers:
+            paths = fetch_filings_for_ticker(
+                ticker=ticker,
+                user_agent=user_agent,
+                store=store,
+                n_annual=1,
+                n_quarterly=n_quarterly,
+            )
+            output.append({"ticker": ticker, **paths})
+
+        return output
+
+    def list_downloaded_filings(self, ticker: str | None = None) -> Any:
+        """
+        Return a DataFrame of all filings logged in the DB.
+        Optionally filter by ticker.
+        """
+        from core.database import FilingMetadataStore
+        store = FilingMetadataStore(self.config.db_path)
+        if ticker:
+            rows = store.get_filings_for_ticker(ticker.upper())
+            import pandas as pd
+            return pd.DataFrame(rows) if rows else pd.DataFrame()
+        return store.get_all_filings()
+
+    # ------------------------------------------------------------------ #
+    #  Sovereign View                                                    #
+    # ------------------------------------------------------------------ #
+
+    def get_full_context(self, ticker: str) -> dict[str, Any]:
+        """
+        Return a unified 'Sovereign View' for a single ticker by joining
+        data from three tables in the database:
+
+            1. transactions    — holdings, cost basis, realised P/L
+            2. filings_metadata — downloaded 10-K and 10-Q reports
+            3. signals          — latest news headlines and transcript events
+
+        Also fetches the current live price for the ticker.
+
+        Returns a structured dict with the following keys:
+            ticker              str
+            position            dict  (quantity, avg_cost, capital_invested,
+                                        market_value, unrealised_pnl,
+                                        unrealised_pnl_pct, current_price)
+                                None if ticker is not in current holdings
+            filings             list[dict]  — all downloaded filings, newest first
+            news                list[dict]  — latest 10 news signals (parsed JSON)
+            transcripts         list[dict]  — latest 5 transcript signals (parsed JSON)
+            generated_at        str  ISO-8601 timestamp of when this view was built
+        """
+        import json as _json
+        from core.database import FilingMetadataStore, SignalStore
+
+        ticker = ticker.upper()
+
+        # -- 1. Position data from live pipeline --
+        pipeline = self.run_pipeline()
+        holdings = pipeline.get("holdings")
+        position: dict[str, Any] | None = None
+        if holdings is not None and not holdings.empty and ticker in holdings.index:
+            row = holdings.loc[ticker]
+            position = {
+                "quantity":          row.get("quantity"),
+                "avg_cost":          row.get("avg_cost"),
+                "capital_invested":  row.get("capital_invested"),
+                "current_price":     row.get("current_price"),
+                "market_value":      row.get("market_value"),
+                "unrealised_pnl":    row.get("unrealised_pnl"),
+                "unrealised_pnl_pct": (
+                    round(row["unrealised_pnl"] / row["capital_invested"] * 100, 2)
+                    if row.get("capital_invested") else None
+                ),
+            }
+
+        # -- 2. Filings from filings_metadata table --
+        filing_store = FilingMetadataStore(self.config.db_path)
+        filings = filing_store.get_filings_for_ticker(ticker)
+
+        # -- 3. Signals from signals table --
+        signal_store = SignalStore(self.config.db_path)
+        raw_news = signal_store.get_signals_for_ticker(ticker, signal_type="news", limit=10)
+        raw_transcripts = signal_store.get_signals_for_ticker(
+            ticker, signal_type="transcript", limit=5
+        )
+
+        def _parse_signals(raw: list[dict]) -> list[dict]:
+            parsed = []
+            for s in raw:
+                try:
+                    payload = _json.loads(s["content"])
+                except (_json.JSONDecodeError, KeyError):
+                    payload = {"raw": s.get("content", "")}
+                parsed.append({
+                    "timestamp": s["timestamp"],
+                    **payload,
+                })
+            return parsed
+
+        return {
+            "ticker":       ticker,
+            "position":     position,
+            "filings":      filings,
+            "news":         _parse_signals(raw_news),
+            "transcripts":  _parse_signals(raw_transcripts),
+            "generated_at": datetime.now().isoformat(),
+        }
+
     def run_pipeline(self) -> dict[str, Any]:
         holdings, realised, cash = self.recalculate_portfolio()
         if not holdings.empty:
