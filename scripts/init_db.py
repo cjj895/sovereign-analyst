@@ -1,33 +1,37 @@
-import sqlite3
+"""
+Initialise all SQLite tables for the Sovereign Analyst project.
+
+Each store class auto-creates its own table on first instantiation,
+so this script simply instantiates every store to guarantee the full
+schema exists.
+
+Run:  .venv/bin/python scripts/init_db.py
+"""
+from __future__ import annotations
+
+import sys
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from core.database import (
+    TransactionStore,
+    FilingMetadataStore,
+    SignalStore,
+    ProcessedFilingStore,
+)
 
 DB_PATH = Path("data/sovereign.db")
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS transactions (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    date        TEXT    NOT NULL,
-    type        TEXT    NOT NULL, -- buy, sell, dividend, income, expense, SPLIT
-    asset       TEXT,
-    ticker      TEXT,
-    price       REAL,
-    quantity    REAL,
-    amount      REAL,
-    description TEXT,
-    ratio       REAL,      -- Only used for SPLIT type (e.g. 10.0 for 10-for-1)
-    created_at  TEXT    DEFAULT (datetime('now'))
-);
 
-CREATE INDEX IF NOT EXISTS idx_tx_date   ON transactions (date);
-CREATE INDEX IF NOT EXISTS idx_tx_ticker ON transactions (ticker);
-"""
+def init_db(db_path: str | Path = DB_PATH) -> None:
+    TransactionStore(db_path)
+    FilingMetadataStore(db_path)
+    SignalStore(db_path)
+    ProcessedFilingStore(db_path)
+    print(f"Database initialised at {db_path}")
 
-def init_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.executescript(SCHEMA)
-    conn.close()
-    print(f"Database initialized at {DB_PATH}")
 
 if __name__ == "__main__":
     init_db()

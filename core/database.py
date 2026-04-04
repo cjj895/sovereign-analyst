@@ -6,11 +6,42 @@ from typing import Any
 
 import pandas as pd
 
-# Shared database path used by both stores
 DEFAULT_DB_PATH = Path("data/sovereign.db")
 
 
-class TransactionStore:
+# ------------------------------------------------------------------ #
+#  Base Store                                                         #
+# ------------------------------------------------------------------ #
+
+class _BaseStore:
+    """
+    Shared foundation for all SQLite-backed stores.
+
+    Subclasses define a class-level ``_SCHEMA`` string containing
+    ``CREATE TABLE IF NOT EXISTS`` statements.  The base class handles
+    connection management, WAL mode, and schema initialisation.
+    """
+
+    _SCHEMA: str = ""
+
+    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            conn.executescript(self._SCHEMA)
+
+
+class TransactionStore(_BaseStore):
     """
     SQLite-backed persistent store for portfolio transactions.
 
@@ -24,13 +55,14 @@ class TransactionStore:
     transactions
         id          INTEGER  PK AUTOINCREMENT
         date        TEXT     ISO-8601 date string  e.g. "2025-08-05"
-        type        TEXT     buy | sell | dividend | income | expense
+        type        TEXT     buy | sell | dividend | income | expense | split
         asset       TEXT     Human-readable name   e.g. "Apple Inc"
         ticker      TEXT     Exchange symbol        e.g. "AAPL"
         price       REAL     Per-share price (NULL for non-investment rows)
         quantity    REAL     Always positive; direction implied by type
         amount      REAL     Signed cash impact (negative = outflow)
         description TEXT     Free-text note
+        ratio       REAL     Split ratio (e.g. 10.0 for 10-for-1), NULL for non-split rows
         created_at  TEXT     Auto-set to UTC timestamp of insertion
     """
 
@@ -45,32 +77,13 @@ class TransactionStore:
         quantity    REAL,
         amount      REAL,
         description TEXT,
+        ratio       REAL,
         created_at  TEXT    DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_tx_date   ON transactions (date);
     CREATE INDEX IF NOT EXISTS idx_tx_ticker ON transactions (ticker);
     CREATE INDEX IF NOT EXISTS idx_tx_type   ON transactions (type);
     """
-
-    def __init__(self, db_path: str | Path = "data/sovereign.db") -> None:
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
-
-    # ------------------------------------------------------------------ #
-    #  Internal helpers                                                   #
-    # ------------------------------------------------------------------ #
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL")  # concurrent-read safe
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
-
-    def _init_db(self) -> None:
-        with self._connect() as conn:
-            conn.executescript(self._SCHEMA)
 
     @staticmethod
     def _null(val: Any) -> Any:
@@ -106,15 +119,16 @@ class TransactionStore:
 
     def load_transactions(self) -> pd.DataFrame:
         """
-        Load all transactions as a DataFrame with the same schema as the
-        legacy CSV so all downstream PortfolioManager methods work unchanged.
+        Load all transactions as a DataFrame in chronological order.
 
         Columns: date (datetime), type (str), asset, ticker,
-                 price (float), quantity (float), amount (float), description
+                 price (float), quantity (float), amount (float),
+                 description, ratio (float, NULL for non-split rows)
         """
         with self._connect() as conn:
             df = pd.read_sql_query(
-                "SELECT date, type, asset, ticker, price, quantity, amount, description "
+                "SELECT date, type, asset, ticker, price, quantity, "
+                "amount, description, ratio "
                 "FROM transactions ORDER BY date ASC, id ASC",
                 conn,
             )
@@ -124,7 +138,7 @@ class TransactionStore:
 
         df["date"] = pd.to_datetime(df["date"])
         df["type"] = df["type"].str.strip().str.lower()
-        numeric_cols = ["price", "quantity", "amount"]
+        numeric_cols = ["price", "quantity", "amount", "ratio"]
         df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
         return df.reset_index(drop=True)
 
@@ -157,6 +171,7 @@ class TransactionStore:
         quantity: float | None = None,
         amount: float | None = None,
         description: str | None = None,
+        ratio: float | None = None,
     ) -> int:
         """
         Insert a single transaction row.
@@ -164,14 +179,15 @@ class TransactionStore:
         Parameters
         ----------
         date     : ISO-8601 string  e.g. "2025-08-05"
-        tx_type  : "buy" | "sell" | "dividend" | "income" | "expense"
+        tx_type  : "buy" | "sell" | "dividend" | "income" | "expense" | "split"
+        ratio    : Split ratio (e.g. 10.0 for 10-for-1), only used for "split" type
 
         Returns the new row's auto-incremented id.
         """
         sql = """
         INSERT INTO transactions
-            (date, type, asset, ticker, price, quantity, amount, description)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (date, type, asset, ticker, price, quantity, amount, description, ratio)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         with self._connect() as conn:
             cursor = conn.execute(sql, (
@@ -183,6 +199,7 @@ class TransactionStore:
                 self._null(quantity),
                 self._null(amount),
                 self._null(description),
+                self._null(ratio),
             ))
             return cursor.lastrowid
 
@@ -266,11 +283,9 @@ class TransactionStore:
         return len(rows)
 
 
-class FilingMetadataStore:
+class FilingMetadataStore(_BaseStore):
     """
     SQLite-backed store for SEC filing download records.
-
-    Operates on the same data/sovereign.db as TransactionStore.
 
     Schema
     ------
@@ -302,21 +317,6 @@ class FilingMetadataStore:
     CREATE INDEX IF NOT EXISTS idx_fm_form_type ON filings_metadata (form_type);
     CREATE INDEX IF NOT EXISTS idx_fm_period    ON filings_metadata (period_of_report);
     """
-
-    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL")
-        return conn
-
-    def _init_db(self) -> None:
-        with self._connect() as conn:
-            conn.executescript(self._SCHEMA)
 
     # ------------------------------------------------------------------ #
     #  Queries                                                            #
@@ -400,11 +400,9 @@ class FilingMetadataStore:
         return True
 
 
-class SignalStore:
+class SignalStore(_BaseStore):
     """
     SQLite-backed store for market signals: news headlines and transcript events.
-
-    Operates on the same data/sovereign.db as TransactionStore and FilingMetadataStore.
 
     Schema
     ------
@@ -433,21 +431,6 @@ class SignalStore:
     CREATE INDEX IF NOT EXISTS idx_sig_type      ON signals (type);
     CREATE INDEX IF NOT EXISTS idx_sig_timestamp ON signals (timestamp);
     """
-
-    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL")
-        return conn
-
-    def _init_db(self) -> None:
-        with self._connect() as conn:
-            conn.executescript(self._SCHEMA)
 
     # ------------------------------------------------------------------ #
     #  Queries                                                            #
@@ -535,7 +518,7 @@ class SignalStore:
         return True
 
 
-class ProcessedFilingStore:
+class ProcessedFilingStore(_BaseStore):
     """
     SQLite-backed store that tracks which SEC filings have been preprocessed.
 
@@ -545,13 +528,11 @@ class ProcessedFilingStore:
       - Paths to the JSON sidecar files holding the text chunks for each section
       - Chunk counts for quick reporting
 
-    Operates on the same data/sovereign.db as the other stores.
-
     Schema
     ------
     processed_files
         id                 INTEGER  PK AUTOINCREMENT
-        accession_number   TEXT     UNIQUE FK → filings_metadata.accession_number
+        accession_number   TEXT     UNIQUE
         ticker             TEXT     Exchange symbol  e.g. "AAPL"
         form_type          TEXT     "10-K" or "10-Q"
         clean_path         TEXT     Absolute path to full-doc clean Markdown
@@ -582,22 +563,6 @@ class ProcessedFilingStore:
     CREATE INDEX IF NOT EXISTS idx_pf_ticker ON processed_files (ticker);
     CREATE INDEX IF NOT EXISTS idx_pf_form   ON processed_files (form_type);
     """
-
-    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
-
-    def _init_db(self) -> None:
-        with self._connect() as conn:
-            conn.executescript(self._SCHEMA)
 
     # ------------------------------------------------------------------ #
     #  Queries                                                            #

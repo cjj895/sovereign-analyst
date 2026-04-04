@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -10,7 +9,7 @@ from typing import Any
 import pandas as pd
 import yfinance as yf
 
-from core.database import FilingMetadataStore, SignalStore
+from core.database import FilingMetadataStore, SignalStore, TransactionStore
 
 
 @dataclass
@@ -32,10 +31,10 @@ class PortfolioManager:
         dividend - cash increases, qty unchanged
         income   - non-investment cash inflow
         expense  - non-investment cash outflow
-        SPLIT    - multiplies current qty by ratio, divides avg_cost by ratio
+        split    - multiplies current qty by ratio, divides avg_cost by ratio
     """
 
-    INVESTMENT_TYPES: frozenset[str] = frozenset({"buy", "sell", "dividend", "SPLIT"})
+    INVESTMENT_TYPES: frozenset[str] = frozenset({"buy", "sell", "dividend", "split"})
     CACHE_TTL_SECONDS: int = 900  # 15 minutes
 
     def __init__(
@@ -47,20 +46,15 @@ class PortfolioManager:
             db_path=Path(db_path),
             history_file=Path(history_file),
         )
+        self.tx_store = TransactionStore(db_path)
         self.snapshot_header: list[str] = [
             "month", "total_capital_invested", "total_market_value",
             "total_unrealised_pnl", "total_realised_pnl", "total_dividends",
             "unrealised_pnl_pct",
         ]
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.config.db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL")
-        return conn
-
     # ------------------------------------------------------------------ #
-    #  DB Operations                                                     #
+    #  DB Operations — delegated to TransactionStore                     #
     # ------------------------------------------------------------------ #
 
     def add_transaction(
@@ -75,22 +69,18 @@ class PortfolioManager:
         description: str | None = None,
         ratio: float | None = None,
     ) -> int:
-        """Execute a SQL INSERT for a new transaction."""
-        sql = """
-        INSERT INTO transactions (date, type, asset, ticker, price, quantity, amount, description, ratio)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """
-        with self._connect() as conn:
-            cursor = conn.execute(sql, (
-                date, tx_type.lower(), asset, ticker, price, quantity, amount, description, ratio
-            ))
-            return cursor.lastrowid
-
-    def load_raw_transactions(self) -> pd.DataFrame:
-        """Fetch all rows from the DB in chronological order."""
-        with self._connect() as conn:
-            df = pd.read_sql_query("SELECT * FROM transactions ORDER BY date ASC, id ASC", conn)
-        return df
+        """Insert a new transaction via TransactionStore."""
+        return self.tx_store.add_transaction(
+            date=date,
+            tx_type=tx_type,
+            asset=asset,
+            ticker=ticker,
+            price=price,
+            quantity=quantity,
+            amount=amount,
+            description=description,
+            ratio=ratio,
+        )
 
     # ------------------------------------------------------------------ #
     #  Portfolio Logic                                                   #
@@ -104,7 +94,7 @@ class PortfolioManager:
         Handles SPLIT transactions by adjusting quantity and cost.
         Ensures no selling more than owned.
         """
-        df = self.load_raw_transactions()
+        df = self.tx_store.load_transactions()
         
         # Running state
         holdings: dict[str, dict] = {}
@@ -304,8 +294,8 @@ class PortfolioManager:
         holdings_df, _, _ = self.recalculate_portfolio()
         position: dict[str, Any] | None = None
         if not holdings_df.empty and ticker in holdings_df.index:
-            prices = self.get_live_prices([ticker])
-            current_price = prices.get(ticker)
+            price_list = self.get_live_prices([ticker])
+            current_price = price_list[0] if price_list else None
             row = holdings_df.loc[ticker]
             capital = float(row.get("capital_invested", 0) or 0)
             qty = float(row.get("quantity", 0) or 0)

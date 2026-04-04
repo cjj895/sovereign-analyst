@@ -1,40 +1,35 @@
-from core.portfolio_engine import PortfolioManager
-import sqlite3
+"""
+Quick integration test for PortfolioManager.
+
+Wipes and recreates the database, seeds sample transactions including a
+SPLIT, runs the pipeline, and prints holdings + summary.
+
+Run:  .venv/bin/python test_engine.py
+"""
 from pathlib import Path
 
-# 1. Initialize DB
+from core.database import TransactionStore
+from core.portfolio_engine import PortfolioManager
+
 DB_PATH = Path("data/sovereign.db")
-if DB_PATH.exists(): DB_PATH.unlink() # Start fresh for this demo
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS transactions (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    date        TEXT    NOT NULL,
-    type        TEXT    NOT NULL,
-    asset       TEXT,
-    ticker      TEXT,
-    price       REAL,
-    quantity    REAL,
-    amount      REAL,
-    description TEXT,
-    ratio       REAL,
-    created_at  TEXT    DEFAULT (datetime('now'))
-);
-"""
-conn = sqlite3.connect(DB_PATH)
-conn.executescript(SCHEMA)
-conn.close()
+# Start fresh
+if DB_PATH.exists():
+    DB_PATH.unlink()
 
-pm = PortfolioManager()
+# Initialise schema via TransactionStore (single source of truth)
+TransactionStore(DB_PATH)
 
-# 2. Seed with some data including a SPLIT
+pm = PortfolioManager(db_path=DB_PATH)
+
+# Seed with test data including a SPLIT
 print("--- Seeding Database ---")
 pm.add_transaction("2024-01-01", "buy", "NVIDIA Corp", "NVDA", price=400.0, quantity=10, amount=-4000.0)
 pm.add_transaction("2024-06-10", "split", "NVIDIA Corp", "NVDA", ratio=10.0, description="10-for-1 forward split")
 pm.add_transaction("2024-07-01", "sell", "NVIDIA Corp", "NVDA", price=120.0, quantity=20, amount=2400.0)
 pm.add_transaction("2024-08-01", "dividend", "NVIDIA Corp", "NVDA", amount=15.0)
 
-# 3. Run Pipeline
+# Run Pipeline
 print("\n--- Running Portfolio Pipeline ---")
 res = pm.run_pipeline()
 
