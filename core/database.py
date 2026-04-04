@@ -533,3 +533,155 @@ class SignalStore:
                 external_id,
             ))
         return True
+
+
+class ProcessedFilingStore:
+    """
+    SQLite-backed store that tracks which SEC filings have been preprocessed.
+
+    For each filing it records:
+      - Paths to the clean full-document Markdown file
+      - Paths to the extracted Item 1A (Risk Factors) and Item 7 (MD&A) section files
+      - Paths to the JSON sidecar files holding the text chunks for each section
+      - Chunk counts for quick reporting
+
+    Operates on the same data/sovereign.db as the other stores.
+
+    Schema
+    ------
+    processed_files
+        id                 INTEGER  PK AUTOINCREMENT
+        accession_number   TEXT     UNIQUE FK → filings_metadata.accession_number
+        ticker             TEXT     Exchange symbol  e.g. "AAPL"
+        form_type          TEXT     "10-K" or "10-Q"
+        clean_path         TEXT     Absolute path to full-doc clean Markdown
+        risk_factors_path  TEXT     Absolute path to Item 1A section Markdown
+        risk_chunks_path   TEXT     Absolute path to Item 1A chunks JSON sidecar
+        mda_path           TEXT     Absolute path to Item 7 section Markdown
+        mda_chunks_path    TEXT     Absolute path to Item 7 chunks JSON sidecar
+        risk_chunk_count   INTEGER  Number of chunks produced for Item 1A
+        mda_chunk_count    INTEGER  Number of chunks produced for Item 7
+        processed_at       TEXT     UTC timestamp of processing
+    """
+
+    _SCHEMA = """
+    CREATE TABLE IF NOT EXISTS processed_files (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        accession_number   TEXT    NOT NULL UNIQUE,
+        ticker             TEXT    NOT NULL,
+        form_type          TEXT    NOT NULL,
+        clean_path         TEXT,
+        risk_factors_path  TEXT,
+        risk_chunks_path   TEXT,
+        mda_path           TEXT,
+        mda_chunks_path    TEXT,
+        risk_chunk_count   INTEGER DEFAULT 0,
+        mda_chunk_count    INTEGER DEFAULT 0,
+        processed_at       TEXT    DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_pf_ticker ON processed_files (ticker);
+    CREATE INDEX IF NOT EXISTS idx_pf_form   ON processed_files (form_type);
+    """
+
+    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            conn.executescript(self._SCHEMA)
+
+    # ------------------------------------------------------------------ #
+    #  Queries                                                            #
+    # ------------------------------------------------------------------ #
+
+    def is_processed(self, accession_number: str) -> bool:
+        """Return True if a processed record already exists for this filing."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM processed_files WHERE accession_number = ?",
+                (accession_number,),
+            ).fetchone()
+        return row is not None
+
+    def get_processed_for_ticker(
+        self,
+        ticker: str,
+        form_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Return all processed filing records for a ticker, newest first.
+        Optionally filter by form_type ("10-K" or "10-Q").
+        """
+        sql = (
+            "SELECT * FROM processed_files WHERE ticker = ?"
+            + (" AND form_type = ?" if form_type else "")
+            + " ORDER BY processed_at DESC"
+        )
+        params = (ticker.upper(), form_type) if form_type else (ticker.upper(),)
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_all_processed(self) -> pd.DataFrame:
+        """Return all processed records as a DataFrame."""
+        with self._connect() as conn:
+            return pd.read_sql_query(
+                "SELECT * FROM processed_files ORDER BY processed_at DESC",
+                conn,
+            )
+
+    # ------------------------------------------------------------------ #
+    #  Writes                                                             #
+    # ------------------------------------------------------------------ #
+
+    def log_processed(
+        self,
+        accession_number: str,
+        ticker: str,
+        form_type: str,
+        clean_path: str | Path | None = None,
+        risk_factors_path: str | Path | None = None,
+        risk_chunks_path: str | Path | None = None,
+        mda_path: str | Path | None = None,
+        mda_chunks_path: str | Path | None = None,
+        risk_chunk_count: int = 0,
+        mda_chunk_count: int = 0,
+    ) -> bool:
+        """
+        Insert a processed filing record.
+        Skips silently if the accession_number already exists.
+        Returns True if a new row was inserted, False if it was a duplicate.
+        """
+        if self.is_processed(accession_number):
+            return False
+
+        sql = """
+        INSERT INTO processed_files
+            (accession_number, ticker, form_type, clean_path,
+             risk_factors_path, risk_chunks_path, mda_path, mda_chunks_path,
+             risk_chunk_count, mda_chunk_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        with self._connect() as conn:
+            conn.execute(sql, (
+                accession_number,
+                ticker.upper(),
+                form_type,
+                str(clean_path) if clean_path else None,
+                str(risk_factors_path) if risk_factors_path else None,
+                str(risk_chunks_path) if risk_chunks_path else None,
+                str(mda_path) if mda_path else None,
+                str(mda_chunks_path) if mda_chunks_path else None,
+                risk_chunk_count,
+                mda_chunk_count,
+            ))
+        return True
