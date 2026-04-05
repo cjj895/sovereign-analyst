@@ -20,6 +20,7 @@ from core.database import (
     FilingMetadataStore,
     SignalStore,
     ProcessedFilingStore,
+    AnalystNoteStore,
 )
 
 DB_PATH = Path("data/sovereign.db")
@@ -30,6 +31,7 @@ def init_db(db_path: str | Path = DB_PATH) -> None:
     FilingMetadataStore(db_path)
     SignalStore(db_path)
     ProcessedFilingStore(db_path)
+    AnalystNoteStore(db_path)
     print(f"Database initialised at {db_path}")
 
 

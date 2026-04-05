@@ -650,3 +650,118 @@ class ProcessedFilingStore(_BaseStore):
                 mda_chunk_count,
             ))
         return True
+
+
+class AnalystNoteStore(_BaseStore):
+    """
+    SQLite-backed store for AI-generated analyst notes.
+
+    Each note is produced by the Gemini API for a specific ticker, drawing
+    on SEC filing chunks (Risk Factors, MD&A) and recent news signals.
+
+    Schema
+    ------
+    analyst_notes
+        id               INTEGER  PK AUTOINCREMENT
+        ticker           TEXT     Exchange symbol  e.g. "AAPL"
+        accession_number TEXT     Filing that sourced the note (NULL if multi-filing)
+        model            TEXT     Gemini model used  e.g. "gemini-2.0-flash"
+        summary          TEXT     One-paragraph executive summary
+        risks            TEXT     JSON array of top risk strings
+        sentiment        TEXT     Management sentiment: "positive" | "neutral" | "negative"
+        raw_response     TEXT     Full LLM response text (for auditing)
+        created_at       TEXT     UTC timestamp of generation
+    """
+
+    _SCHEMA = """
+    CREATE TABLE IF NOT EXISTS analyst_notes (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker           TEXT    NOT NULL,
+        accession_number TEXT,
+        model            TEXT    NOT NULL,
+        summary          TEXT    NOT NULL,
+        risks            TEXT    NOT NULL,
+        sentiment        TEXT    NOT NULL,
+        raw_response     TEXT    NOT NULL,
+        created_at       TEXT    DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_an_ticker     ON analyst_notes (ticker);
+    CREATE INDEX IF NOT EXISTS idx_an_created_at ON analyst_notes (created_at);
+    """
+
+    # ------------------------------------------------------------------ #
+    #  Queries                                                            #
+    # ------------------------------------------------------------------ #
+
+    def get_latest_note(self, ticker: str) -> dict[str, Any] | None:
+        """Return the most recently generated note for a ticker, or None."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM analyst_notes WHERE ticker = ? ORDER BY created_at DESC LIMIT 1",
+                (ticker.upper(),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_notes_for_ticker(self, ticker: str, limit: int = 10) -> list[dict[str, Any]]:
+        """Return the most recent notes for a ticker, newest first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM analyst_notes WHERE ticker = ? ORDER BY created_at DESC LIMIT ?",
+                (ticker.upper(), limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_all_notes(self) -> pd.DataFrame:
+        """Return all analyst notes as a DataFrame, newest first."""
+        with self._connect() as conn:
+            return pd.read_sql_query(
+                "SELECT * FROM analyst_notes ORDER BY created_at DESC", conn
+            )
+
+    # ------------------------------------------------------------------ #
+    #  Writes                                                             #
+    # ------------------------------------------------------------------ #
+
+    def log_note(
+        self,
+        ticker: str,
+        model: str,
+        summary: str,
+        risks: list[str],
+        sentiment: str,
+        raw_response: str,
+        accession_number: str | None = None,
+    ) -> int:
+        """
+        Persist a generated analyst note.
+
+        Parameters
+        ----------
+        ticker           : Exchange symbol e.g. "AAPL"
+        model            : Gemini model name e.g. "gemini-2.0-flash"
+        summary          : Executive summary paragraph
+        risks            : List of top risk strings (stored as JSON)
+        sentiment        : "positive" | "neutral" | "negative"
+        raw_response     : Full LLM response text
+        accession_number : Source filing accession number (optional)
+
+        Returns the new row's auto-incremented id.
+        """
+        import json as _json
+
+        sql = """
+        INSERT INTO analyst_notes
+            (ticker, accession_number, model, summary, risks, sentiment, raw_response)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(sql, (
+                ticker.upper(),
+                accession_number,
+                model,
+                summary,
+                _json.dumps(risks, ensure_ascii=False),
+                sentiment,
+                raw_response,
+            ))
+            return cursor.lastrowid
