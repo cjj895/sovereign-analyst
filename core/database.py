@@ -689,6 +689,29 @@ class AnalystNoteStore(_BaseStore):
     CREATE INDEX IF NOT EXISTS idx_an_created_at ON analyst_notes (created_at);
     """
 
+    def _init_db(self) -> None:
+        """Run schema creation then idempotent column migrations."""
+        super()._init_db()
+        self._run_migrations()
+
+    def _run_migrations(self) -> None:
+        """
+        Apply incremental schema migrations that cannot use CREATE IF NOT EXISTS.
+
+        Each ALTER TABLE is wrapped in a try/except so the method is safe
+        to call on both new and existing databases.
+        """
+        migrations = [
+            "ALTER TABLE analyst_notes ADD COLUMN delta_summary TEXT",
+            "ALTER TABLE analyst_notes ADD COLUMN confidence_score REAL",
+        ]
+        with self._connect() as conn:
+            for sql in migrations:
+                try:
+                    conn.execute(sql)
+                except sqlite3.OperationalError:
+                    pass  # column already exists
+
     # ------------------------------------------------------------------ #
     #  Queries                                                            #
     # ------------------------------------------------------------------ #
@@ -765,3 +788,93 @@ class AnalystNoteStore(_BaseStore):
                 raw_response,
             ))
             return cursor.lastrowid
+
+    def log_delta(
+        self,
+        ticker: str,
+        model: str,
+        verdict: str,
+        delta_json: str,
+        raw_response: str,
+        accession_number_new: str | None = None,
+        accession_number_old: str | None = None,
+    ) -> int:
+        """
+        Persist a Surgical Delta analysis as an analyst_notes row.
+
+        Parameters
+        ----------
+        ticker               : Exchange symbol e.g. "AAPL"
+        model                : Gemini model name e.g. "gemini-2.0-flash"
+        verdict              : One-sentence overall verdict from the delta
+        delta_json           : Full JSON string returned by Gemini (added/removed/softened)
+        raw_response         : Unmodified LLM response text (for auditing)
+        accession_number_new : Accession number of the newer filing
+        accession_number_old : Accession number of the older filing
+
+        Sentiment is inferred from verdict text:
+            "worsened" or "obscured" → "negative"
+            "improved"               → "positive"
+            otherwise                → "neutral"
+
+        Returns the new row's auto-incremented id.
+        """
+        import json as _json
+
+        verdict_lower = verdict.lower()
+        if any(w in verdict_lower for w in ("worsen", "obscur", "hidden", "buried", "weaken")):
+            sentiment = "negative"
+        elif "improv" in verdict_lower:
+            sentiment = "positive"
+        else:
+            sentiment = "neutral"
+
+        ref = f"{accession_number_new or 'NEW'} vs {accession_number_old or 'OLD'}"
+
+        sql = """
+        INSERT INTO analyst_notes
+            (ticker, accession_number, model, summary, risks, sentiment,
+             raw_response, delta_summary)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(sql, (
+                ticker.upper(),
+                ref,
+                model,
+                verdict,
+                _json.dumps([], ensure_ascii=False),
+                sentiment,
+                raw_response,
+                delta_json,
+            ))
+            return cursor.lastrowid
+
+    def get_latest_delta(self, ticker: str) -> dict[str, Any] | None:
+        """Return the most recently generated delta note for a ticker, or None."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM analyst_notes "
+                "WHERE ticker = ? AND delta_summary IS NOT NULL "
+                "ORDER BY created_at DESC LIMIT 1",
+                (ticker.upper(),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update_confidence(self, note_id: int, score: float) -> bool:
+        """
+        Persist the computed Source-Trace confidence score onto a note row.
+
+        Parameters
+        ----------
+        note_id : Primary key of the analyst_notes row to update.
+        score   : Confidence score in [0, 100].
+
+        Returns True if a row was updated, False if the id was not found.
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE analyst_notes SET confidence_score = ? WHERE id = ?",
+                (round(score, 2), note_id),
+            )
+        return cursor.rowcount > 0
