@@ -15,6 +15,9 @@ Usage
     # Scoped to a single ticker
     results = qe.query("Discuss revenue growth drivers", ticker="AAPL")
 
+    # Scoped to multiple tickers (for cross-ticker comparison)
+    results = qe.query("China export controls", ticker=["NVDA", "AMD"])
+
     # Scoped to a ticker + section
     results = qe.query("Forward-looking guidance on margins", ticker="AAPL", section="mda")
 
@@ -108,7 +111,7 @@ class QueryEngine:
     def query(
         self,
         question: str,
-        ticker: str | None = None,
+        ticker: str | list[str] | None = None,
         section: str | None = None,
         form_type: str | None = None,
         n_results: int = 5,
@@ -120,7 +123,10 @@ class QueryEngine:
         Parameters
         ----------
         question  : Natural language question (e.g. "What are liquidity risks?")
-        ticker    : Restrict to a single ticker, e.g. "AAPL".  None = all tickers.
+        ticker    : Restrict results to one or more tickers.
+                    - str  → single ticker, e.g. "AAPL"
+                    - list → multiple tickers, e.g. ["NVDA", "AMD"]
+                    - None → no restriction (all tickers)
         section   : "risk_factors" | "mda" | None (both).
         form_type : "10-K" | "10-Q" | None (both).
         n_results : Number of results to return (default 5).
@@ -179,7 +185,7 @@ class QueryEngine:
 
     @staticmethod
     def _build_where(
-        ticker: str | None,
+        ticker: str | list[str] | None,
         section: str | None,
         form_type: str | None,
     ) -> dict[str, Any] | None:
@@ -187,11 +193,20 @@ class QueryEngine:
         Build a ChromaDB metadata filter dict, or None if no filters are needed.
 
         Combines multiple filters with $and when more than one is active.
+        When ticker is a list, uses the $in operator so a single query can
+        span multiple companies (used by the cross-ticker comparison engine).
         """
         clauses: list[dict[str, Any]] = []
 
         if ticker:
-            clauses.append({"ticker": {"$eq": ticker.upper()}})
+            if isinstance(ticker, list):
+                upper = [t.upper() for t in ticker if t]
+                if len(upper) == 1:
+                    clauses.append({"ticker": {"$eq": upper[0]}})
+                elif len(upper) > 1:
+                    clauses.append({"ticker": {"$in": upper}})
+            else:
+                clauses.append({"ticker": {"$eq": ticker.upper()}})
         if section:
             clauses.append({"section": {"$eq": section}})
         if form_type:

@@ -704,6 +704,7 @@ class AnalystNoteStore(_BaseStore):
         migrations = [
             "ALTER TABLE analyst_notes ADD COLUMN delta_summary TEXT",
             "ALTER TABLE analyst_notes ADD COLUMN confidence_score REAL",
+            "ALTER TABLE analyst_notes ADD COLUMN intensity_delta INTEGER",
         ]
         with self._connect() as conn:
             for sql in migrations:
@@ -798,6 +799,7 @@ class AnalystNoteStore(_BaseStore):
         raw_response: str,
         accession_number_new: str | None = None,
         accession_number_old: str | None = None,
+        intensity_delta: int | None = None,
     ) -> int:
         """
         Persist a Surgical Delta analysis as an analyst_notes row.
@@ -811,6 +813,10 @@ class AnalystNoteStore(_BaseStore):
         raw_response         : Unmodified LLM response text (for auditing)
         accession_number_new : Accession number of the newer filing
         accession_number_old : Accession number of the older filing
+        intensity_delta      : Proprietary intensity score -10 to +10.
+                               Positive = language became MORE severe/alarming.
+                               Negative = language became more muted/softened.
+                               None = not yet scored.
 
         Sentiment is inferred from verdict text:
             "worsened" or "obscured" → "negative"
@@ -834,8 +840,8 @@ class AnalystNoteStore(_BaseStore):
         sql = """
         INSERT INTO analyst_notes
             (ticker, accession_number, model, summary, risks, sentiment,
-             raw_response, delta_summary)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             raw_response, delta_summary, intensity_delta)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         with self._connect() as conn:
             cursor = conn.execute(sql, (
@@ -847,6 +853,7 @@ class AnalystNoteStore(_BaseStore):
                 sentiment,
                 raw_response,
                 delta_json,
+                intensity_delta,
             ))
             return cursor.lastrowid
 

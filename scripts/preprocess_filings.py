@@ -24,6 +24,8 @@ import json
 import logging
 import re
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -362,9 +364,13 @@ def process_filing(
     store: ProcessedFilingStore,
     chunk_size: int = 1000,
     chunk_overlap: int = 150,
+    db_lock: threading.Lock | None = None,
 ) -> dict[str, Any] | None:
     """
     Run the full preprocessing pipeline for a single raw filing file.
+
+    Thread-safe: pass a shared threading.Lock via `db_lock` when calling
+    from a ThreadPoolExecutor so SQLite writes are serialized across workers.
 
     Returns a result dict on success, or None if the filing was already
     processed (idempotent — safe to call repeatedly).
@@ -456,19 +462,20 @@ def process_filing(
     else:
         log.warning("  Item 7 (MD&A) not found in %s.", raw_path.name)
 
-    # Step 5 — log to DB
-    store.log_processed(
-        accession_number=accession_number,
-        ticker=ticker,
-        form_type=form_type,
-        clean_path=clean_path,
-        risk_factors_path=risk_factors_path,
-        risk_chunks_path=risk_chunks_path,
-        mda_path=mda_path,
-        mda_chunks_path=mda_chunks_path,
-        risk_chunk_count=risk_chunk_count,
-        mda_chunk_count=mda_chunk_count,
-    )
+    # Step 5 — log to DB (serialized via lock when running in parallel)
+    with db_lock or threading.Lock():
+        store.log_processed(
+            accession_number=accession_number,
+            ticker=ticker,
+            form_type=form_type,
+            clean_path=clean_path,
+            risk_factors_path=risk_factors_path,
+            risk_chunks_path=risk_chunks_path,
+            mda_path=mda_path,
+            mda_chunks_path=mda_chunks_path,
+            risk_chunk_count=risk_chunk_count,
+            mda_chunk_count=mda_chunk_count,
+        )
     log.info("  Logged to DB  [%s]", accession_number)
 
     return {
@@ -488,12 +495,29 @@ def process_filing(
 #  CLI                                                                #
 # ------------------------------------------------------------------ #
 
-def main(ticker_filter: str | None = None) -> None:
+def main(
+    ticker_filter: str | None = None,
+    max_workers: int = 4,
+) -> None:
     """
-    Iterate data/raw_filings/*.txt and preprocess each one.
-    Optionally restrict to a single ticker with --ticker AAPL.
+    Iterate data/raw_filings/*.txt and preprocess each one in parallel.
+
+    Parameters
+    ----------
+    ticker_filter : Only process filings for this ticker (e.g. "AAPL").
+    max_workers   : Thread pool size (default 4).
+                    BeautifulSoup is I/O-heavy for large files so threads
+                    provide a meaningful speedup even with the GIL.
+
+    Thread safety
+    -------------
+    - A single threading.Lock serializes all SQLite writes so no two
+      threads corrupt the processed_files table simultaneously.
+    - If one filing raises an unhandled exception, the error is logged
+      and the pool continues with the remaining files.
     """
-    store = ProcessedFilingStore()
+    store    = ProcessedFilingStore()
+    db_lock  = threading.Lock()
 
     raw_files = sorted(RAW_DIR.glob("*.txt"))
     if not raw_files:
@@ -501,15 +525,36 @@ def main(ticker_filter: str | None = None) -> None:
         return
 
     if ticker_filter:
-        raw_files = [f for f in raw_files if f.name.upper().startswith(ticker_filter.upper() + "_")]
+        raw_files = [
+            f for f in raw_files
+            if f.name.upper().startswith(ticker_filter.upper() + "_")
+        ]
 
-    log.info("Found %d filing(s) to process.", len(raw_files))
+    log.info(
+        "Found %d filing(s) to process (max_workers=%d).",
+        len(raw_files), max_workers,
+    )
 
     results: list[dict[str, Any]] = []
-    for raw_path in raw_files:
-        result = process_filing(raw_path, store)
-        if result:
-            results.append(result)
+    errors:  list[str]            = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(process_filing, raw_path, store, 1000, 150, db_lock): raw_path
+            for raw_path in raw_files
+        }
+        for future in as_completed(futures):
+            raw_path = futures[future]
+            try:
+                result = future.result()
+                if result:
+                    results.append(result)
+            except Exception as exc:
+                log.error(
+                    "Unhandled error processing %s: %s",
+                    raw_path.name, exc, exc_info=True,
+                )
+                errors.append(raw_path.name)
 
     # Summary
     print("\n" + "=" * 70)
@@ -523,20 +568,33 @@ def main(ticker_filter: str | None = None) -> None:
             continue
         name = f"{r['ticker']}_{r['form_type']}"
         risk = str(r["risk_chunk_count"]) + " chunks"
-        mda = str(r["mda_chunk_count"]) + " chunks"
+        mda  = str(r["mda_chunk_count"]) + " chunks"
         print(f"  {name:<40} {'OK':<10} {risk:<8} {mda:<8}")
+    if errors:
+        print(f"\n  ERRORS ({len(errors)} filing(s) failed):")
+        for e in errors:
+            print(f"    ✗ {e}")
     print("=" * 70)
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Preprocess SEC EDGAR filings.")
+    parser = argparse.ArgumentParser(
+        description="Preprocess SEC EDGAR filings (parallel)."
+    )
     parser.add_argument(
         "--ticker",
         type=str,
         default=None,
         help="Only process filings for this ticker (e.g. AAPL).",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        metavar="N",
+        help="Number of parallel worker threads (default: 4).",
+    )
     args = parser.parse_args()
-    main(ticker_filter=args.ticker)
+    main(ticker_filter=args.ticker, max_workers=args.workers)

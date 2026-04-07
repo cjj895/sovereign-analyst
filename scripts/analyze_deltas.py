@@ -213,6 +213,7 @@ Respond with ONLY a valid JSON object. No markdown fences. No explanation. Use t
       "interpretation": "<brief explanation of why this weakening is material>"
     }}
   ],
+  "intensity_delta": <integer from -10 to +10>,
   "verdict": "<one sentence: overall direction of risk posture change — improved, worsened, or obscured — and the most important single finding>"
 }}
 
@@ -226,7 +227,17 @@ Rules:
   underlying risk changing. Examples: "will" -> "may", "severe" -> "potential",
   "material adverse effect" -> "could affect results".
 - Keep all arrays empty ([]) if no changes of that type were found.
-- The 'verdict' must be exactly one sentence."""
+- The 'verdict' must be exactly one sentence.
+- 'intensity_delta' is a proprietary score measuring how much MORE alarming (+) or
+  MORE muted (-) the overall risk language is in Filing B compared to Filing A.
+  Scoring guide:
+    +8 to +10 : Major escalation — new severe adjectives, new mandatory warnings, new quantified losses.
+    +4 to +7  : Moderate intensification — stronger modifiers, expanded scope.
+    +1 to +3  : Mild tightening — minor wording upgrades.
+    0         : No meaningful language shift.
+    -1 to -3  : Mild softening — slight qualifier downgrades (e.g. "will" → "may").
+    -4 to -7  : Moderate softening — removal of quantifiers, weaker adjectives.
+    -8 to -10 : Significant obfuscation — key risk sections removed or buried."""
 
 
 # ------------------------------------------------------------------ #
@@ -288,12 +299,41 @@ def _parse_response(parsed: dict[str, Any], raw: str) -> dict[str, Any]:
             )
 
     parsed["verdict"] = str(parsed["verdict"]).strip()
+
+    # Normalise intensity_delta: clamp to [-10, +10], default to 0 if absent or invalid
+    raw_intensity = parsed.get("intensity_delta")
+    try:
+        parsed["intensity_delta"] = max(-10, min(10, int(raw_intensity)))
+    except (TypeError, ValueError):
+        log.warning(
+            "intensity_delta not present or non-integer (%r) — defaulting to 0.",
+            raw_intensity,
+        )
+        parsed["intensity_delta"] = 0
+
     return parsed
 
 
 # ------------------------------------------------------------------ #
 #  Display                                                             #
 # ------------------------------------------------------------------ #
+
+def _intensity_label(score: int) -> str:
+    """Return a human-readable label for an intensity_delta score."""
+    if score >= 8:
+        return "MAJOR ESCALATION"
+    if score >= 4:
+        return "MODERATE INTENSIFICATION"
+    if score >= 1:
+        return "MILD TIGHTENING"
+    if score == 0:
+        return "UNCHANGED"
+    if score >= -3:
+        return "MILD SOFTENING"
+    if score >= -7:
+        return "MODERATE SOFTENING"
+    return "SIGNIFICANT OBFUSCATION"
+
 
 def _print_delta(
     ticker: str,
@@ -302,18 +342,23 @@ def _print_delta(
     period_old: str,
 ) -> None:
     """Pretty-print the Surgical Delta result to stdout."""
-    width = 70
+    width    = 70
+    intensity = parsed.get("intensity_delta", 0)
+    sign      = f"+{intensity}" if intensity > 0 else str(intensity)
+
     print("\n" + "=" * width)
     print(f"  SURGICAL DELTA — {ticker}")
     print(f"  Comparing: {period_old}  →  {period_new}")
     print("=" * width)
 
-    added   = parsed.get("added",   [])
-    removed = parsed.get("removed", [])
+    added    = parsed.get("added",    [])
+    removed  = parsed.get("removed",  [])
     softened = parsed.get("softened", [])
-    verdict  = parsed.get("verdict", "")
+    verdict  = parsed.get("verdict",  "")
 
-    print(f"\nADDED ({len(added)} new disclosures)\n")
+    print(f"\n  INTENSITY DELTA : {sign} / 10  ({_intensity_label(intensity)})\n")
+
+    print(f"ADDED ({len(added)} new disclosures)\n")
     if added:
         for i, item in enumerate(added, 1):
             print(f"  {i}. {item}")
@@ -419,8 +464,12 @@ def run_delta(
         raw_response=raw_response,
         accession_number_new=rec_new.get("accession_number"),
         accession_number_old=rec_old.get("accession_number"),
+        intensity_delta=parsed.get("intensity_delta"),
     )
-    log.info("Delta saved to analyst_notes (id=%d)", note_id)
+    log.info(
+        "Delta saved to analyst_notes (id=%d, intensity_delta=%s)",
+        note_id, parsed.get("intensity_delta"),
+    )
 
     if show:
         _print_delta(ticker, parsed, period_new, period_old)

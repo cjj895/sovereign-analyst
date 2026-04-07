@@ -21,6 +21,7 @@ Usage
     python sovereign.py query "What are the liquidity risks?" [--ticker AAPL] [--section risk_factors] [--n 5]
     python sovereign.py scan
     python sovereign.py verify AAPL [--note-id 3] [--save]
+    python sovereign.py compare NVDA AMD --theme "China Export Controls"
 """
 from __future__ import annotations
 
@@ -227,6 +228,18 @@ def cmd_verify(args: argparse.Namespace) -> None:
     verify_note(ticker=args.ticker.upper(), note_id=args.note_id, save=args.save)
 
 
+def cmd_compare(args: argparse.Namespace) -> None:
+    """Cross-ticker competitive intelligence on a given theme."""
+    from scripts.compare_tickers import compare_tickers
+    compare_tickers(
+        tickers=args.tickers,
+        theme=args.theme,
+        n_chunks=args.n,
+        model=args.model,
+        show=True,
+    )
+
+
 def cmd_audit(args: argparse.Namespace) -> None:
     """Audit the Sovereign View for a ticker and print the result."""
     from scripts.audit_sovereign_view import audit
@@ -282,6 +295,7 @@ Examples:
   python sovereign.py audit AAPL
   python sovereign.py scan
   python sovereign.py verify AAPL --save
+  python sovereign.py compare NVDA AMD --theme "China Export Controls"
   python sovereign.py query "What are the liquidity risks?" --ticker AAPL
         """,
     )
@@ -346,6 +360,28 @@ Examples:
         help="Write the computed confidence_score back to analyst_notes.",
     )
 
+    # compare
+    p_compare = sub.add_parser(
+        "compare",
+        help="Cross-ticker competitive intelligence on a given theme.",
+    )
+    p_compare.add_argument(
+        "tickers", type=str, nargs="+", metavar="TICKER",
+        help="Two or more ticker symbols e.g. NVDA AMD",
+    )
+    p_compare.add_argument(
+        "--theme", type=str, required=True,
+        help='Risk theme to compare on, e.g. "China Export Controls".',
+    )
+    p_compare.add_argument(
+        "--n", type=int, default=4, metavar="N",
+        help="Filing chunks per ticker fed to Gemini (default: 4).",
+    )
+    p_compare.add_argument(
+        "--model", type=str, default="gemini-2.0-flash",
+        help="Gemini model to use (default: gemini-2.0-flash).",
+    )
+
     # query
     p_query = sub.add_parser("query", help="Semantic search over embedded filing chunks.")
     p_query.add_argument("question", type=str, help="Natural language question.")
@@ -372,6 +408,7 @@ _HANDLERS = {
     "audit":         cmd_audit,
     "scan":          cmd_scan,
     "verify":        cmd_verify,
+    "compare":       cmd_compare,
     "query":         cmd_query,
 }
 

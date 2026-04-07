@@ -28,7 +28,9 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +40,13 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+    before_sleep_log,
+)
 
 import chromadb
 from chromadb.config import Settings
@@ -63,9 +72,13 @@ CHROMA_PATH = PROJECT_ROOT / "data" / "chroma_db"
 COLLECTION_NAME = "sovereign_filings"
 EMBED_MODEL = "models/text-embedding-004"
 
-# Seconds to sleep between Gemini embedding calls.
-# Free tier: 1,500 RPM → ~0.04s minimum; 0.1s is a comfortable buffer.
+# Seconds to sleep between Gemini embedding calls (per-thread).
+# Free tier: 1,500 RPM total → 0.1s per request leaves headroom.
 EMBED_SLEEP = 0.1
+
+# Maximum concurrent Gemini API calls across all threads.
+# At 3 workers × 0.1s sleep ≈ 30 RPM safety margin against free-tier limits.
+MAX_EMBED_WORKERS = 3
 
 # Sections we process.  Maps section key → column name in processed_files.
 SECTIONS: dict[str, str] = {
@@ -97,21 +110,40 @@ def get_collection(chroma_path: Path = CHROMA_PATH) -> chromadb.Collection:
 
 
 # ------------------------------------------------------------------ #
-#  Gemini embedding helper                                            #
+#  Gemini embedding helper (with tenacity retry for 429 errors)      #
 # ------------------------------------------------------------------ #
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """Return True if the exception looks like a Gemini 429 rate-limit."""
+    msg = str(exc).lower()
+    return "429" in msg or "resource_exhausted" in msg or "quota" in msg
+
 
 def embed_text(client: genai.Client, text: str) -> list[float]:
     """
     Generate a retrieval-document embedding for `text` using the Gemini API.
 
+    Decorated with tenacity to automatically retry on 429 RESOURCE_EXHAUSTED
+    errors with exponential back-off (2s → 4s → 8s → 16s → 60s cap, 5 tries).
+
     Returns a list[float] of length 768 (text-embedding-004 output dimension).
     """
-    response = client.models.embed_content(
-        model=EMBED_MODEL,
-        contents=text,
-        config=genai_types.EmbedContentConfig(task_type="retrieval_document"),
+    @retry(
+        retry=retry_if_exception(_is_rate_limit_error),
+        wait=wait_exponential(multiplier=2, min=2, max=60),
+        stop=stop_after_attempt(5),
+        before_sleep=before_sleep_log(log, logging.WARNING),
+        reraise=True,
     )
-    return response.embeddings[0].values
+    def _call() -> list[float]:
+        response = client.models.embed_content(
+            model=EMBED_MODEL,
+            contents=text,
+            config=genai_types.EmbedContentConfig(task_type="retrieval_document"),
+        )
+        return response.embeddings[0].values
+
+    return _call()
 
 
 # ------------------------------------------------------------------ #
@@ -123,14 +155,23 @@ def embed_filing(
     genai_client: genai.Client,
     collection: chromadb.Collection,
     dry_run: bool = False,
+    api_semaphore: threading.Semaphore | None = None,
+    upsert_lock: threading.Lock | None = None,
 ) -> dict[str, int]:
     """
     Process one row from the processed_files table.
 
     For each section (risk_factors, mda):
       1. Load JSON chunks from the sidecar path stored in the DB row.
-      2. Generate a Gemini embedding per chunk.
-      3. Upsert into ChromaDB with structured metadata.
+      2. Generate a Gemini embedding per chunk (with tenacity retry on 429).
+      3. Batch all chunks for the section and upsert into ChromaDB.
+
+    Parameters
+    ----------
+    api_semaphore : Shared semaphore capping concurrent Gemini API calls
+                    across all threads.  Pass None for single-threaded use.
+    upsert_lock   : Shared lock serializing ChromaDB upsert calls across
+                    threads.  Pass None for single-threaded use.
 
     Returns a dict {section: chunks_upserted} for reporting.
     """
@@ -166,10 +207,10 @@ def embed_filing(
             ticker, form_type, section, len(chunks),
         )
 
-        doc_ids:    list[str]       = []
+        doc_ids:    list[str]         = []
         embeddings: list[list[float]] = []
-        documents:  list[str]       = []
-        metadatas:  list[dict]      = []
+        documents:  list[str]         = []
+        metadatas:  list[dict]        = []
 
         for i, chunk in enumerate(chunks):
             if not chunk.strip():
@@ -181,8 +222,15 @@ def embed_filing(
                 log.info("    [DRY RUN] would embed doc_id=%s", doc_id)
                 continue
 
-            embedding = embed_text(genai_client, chunk)
-            time.sleep(EMBED_SLEEP)
+            # Acquire semaphore to cap concurrent Gemini API calls
+            if api_semaphore is not None:
+                api_semaphore.acquire()
+            try:
+                embedding = embed_text(genai_client, chunk)
+                time.sleep(EMBED_SLEEP)
+            finally:
+                if api_semaphore is not None:
+                    api_semaphore.release()
 
             doc_ids.append(doc_id)
             embeddings.append(embedding)
@@ -197,12 +245,13 @@ def embed_filing(
             })
 
         if doc_ids:
-            collection.upsert(
-                ids=doc_ids,
-                embeddings=embeddings,
-                documents=documents,
-                metadatas=metadatas,
-            )
+            with upsert_lock or threading.Lock():
+                collection.upsert(
+                    ids=doc_ids,
+                    embeddings=embeddings,
+                    documents=documents,
+                    metadatas=metadatas,
+                )
 
         counts[section] = len(doc_ids)
 
@@ -213,12 +262,31 @@ def embed_filing(
 #  Main                                                               #
 # ------------------------------------------------------------------ #
 
-def main(ticker_filter: str | None = None, dry_run: bool = False) -> None:
+def main(
+    ticker_filter: str | None = None,
+    dry_run: bool = False,
+    max_workers: int = MAX_EMBED_WORKERS,
+) -> None:
     """
-    Embed all preprocessed filings, optionally restricted to one ticker.
+    Embed all preprocessed filings in parallel, optionally restricted to
+    one ticker.
 
     Reads from the processed_files table and JSON sidecar files on disk.
     Upserts embeddings into ChromaDB at data/chroma_db/.
+
+    Concurrency controls
+    --------------------
+    api_semaphore : Caps concurrent Gemini API calls to `max_workers` so we
+                    stay within rate limits even when multiple filings are
+                    processed simultaneously.
+    upsert_lock   : Serialises ChromaDB upsert() calls — the ChromaDB
+                    PersistentClient is not guaranteed to be thread-safe for
+                    concurrent writes.
+
+    Error isolation
+    ---------------
+    If one filing's embedding fails (e.g. malformed sidecar, persistent 429),
+    it is logged and the pool continues with the remaining filings.
     """
     load_dotenv()
     api_key = os.getenv("GEMINI_API_KEY")
@@ -226,9 +294,11 @@ def main(ticker_filter: str | None = None, dry_run: bool = False) -> None:
         log.error("GEMINI_API_KEY not set in .env — aborting.")
         sys.exit(1)
 
-    genai_client = genai.Client(api_key=api_key)
+    genai_client  = genai.Client(api_key=api_key)
+    collection    = get_collection()
+    api_semaphore = threading.Semaphore(max_workers)
+    upsert_lock   = threading.Lock()
 
-    collection = get_collection()
     log.info(
         "ChromaDB collection '%s' ready — %d docs already indexed.",
         COLLECTION_NAME,
@@ -248,26 +318,44 @@ def main(ticker_filter: str | None = None, dry_run: bool = False) -> None:
             log.error("No preprocessed filings for ticker '%s'.", ticker_filter)
             sys.exit(1)
 
-    log.info("Processing %d filing(s).", len(df))
+    log.info("Embedding %d filing(s) with %d worker(s).", len(df), max_workers)
+
+    rows = [row.to_dict() for _, row in df.iterrows()]
 
     total_risk = total_mda = 0
+    errors: list[str] = []
 
-    for _, row in df.iterrows():
-        accession = row["accession_number"]
-        ticker    = row["ticker"].upper()
-        form_type = row["form_type"]
-
-        log.info("Filing: %s  [%s  %s]", accession, ticker, form_type)
-
-        counts = embed_filing(
-            row=row.to_dict(),
-            genai_client=genai_client,
-            collection=collection,
-            dry_run=dry_run,
-        )
-
-        total_risk += counts.get("risk_factors", 0)
-        total_mda  += counts.get("mda", 0)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(
+                embed_filing,
+                row,
+                genai_client,
+                collection,
+                dry_run,
+                api_semaphore,
+                upsert_lock,
+            ): row["accession_number"]
+            for row in rows
+        }
+        for future in as_completed(futures):
+            accession = futures[future]
+            try:
+                counts = future.result()
+                total_risk += counts.get("risk_factors", 0)
+                total_mda  += counts.get("mda", 0)
+                log.info(
+                    "Done: %s  (risk=%d, mda=%d)",
+                    accession,
+                    counts.get("risk_factors", 0),
+                    counts.get("mda", 0),
+                )
+            except Exception as exc:
+                log.error(
+                    "Failed to embed %s: %s",
+                    accession, exc, exc_info=True,
+                )
+                errors.append(accession)
 
     print("\n" + "=" * 65)
     print("EMBED SUMMARY")
@@ -275,13 +363,17 @@ def main(ticker_filter: str | None = None, dry_run: bool = False) -> None:
     print(f"  Collection     : {COLLECTION_NAME}")
     print(f"  Total indexed  : {collection.count()} docs")
     print(f"  This run       : {total_risk} risk chunks + {total_mda} MD&A chunks upserted")
+    if errors:
+        print(f"  Errors         : {len(errors)} filing(s) failed → {errors}")
     if dry_run:
         print("  (DRY RUN — no embeddings were generated or stored)")
     print("=" * 65)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Embed preprocessed SEC filings into ChromaDB.")
+    parser = argparse.ArgumentParser(
+        description="Embed preprocessed SEC filings into ChromaDB (parallel, with retry)."
+    )
     parser.add_argument(
         "--ticker",
         type=str,
@@ -293,5 +385,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Walk through filings without calling the Gemini API or writing to ChromaDB.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=MAX_EMBED_WORKERS,
+        metavar="N",
+        help=f"Max concurrent Gemini API calls (default: {MAX_EMBED_WORKERS}).",
+    )
     args = parser.parse_args()
-    main(ticker_filter=args.ticker, dry_run=args.dry_run)
+    main(ticker_filter=args.ticker, dry_run=args.dry_run, max_workers=args.workers)

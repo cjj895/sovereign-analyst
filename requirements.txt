@@ -4,4 +4,6 @@ matplotlib
 python-dotenv
 sec-api
 google-generativeai
+streamlit
+plotly
 
