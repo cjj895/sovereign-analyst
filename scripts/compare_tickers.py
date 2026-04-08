@@ -314,31 +314,24 @@ def compare_tickers(
     Returns the parsed Gemini response dict.
     """
     if len(tickers) < 2:
-        log.error("At least two tickers are required for comparison.")
-        sys.exit(1)
+        raise ValueError("At least two tickers are required for comparison.")
 
     load_dotenv()
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        log.error("GEMINI_API_KEY not set in .env — aborting.")
-        sys.exit(1)
+        raise EnvironmentError("GEMINI_API_KEY not set in .env")
 
     tickers = [t.upper() for t in tickers]
     log.info("Comparing %s on theme: '%s'", " vs ".join(tickers), theme)
 
     # -- 1. Initialise QueryEngine --
-    try:
-        qe = QueryEngine()
-    except EnvironmentError as exc:
-        log.error("%s", exc)
-        sys.exit(1)
+    qe = QueryEngine()
 
     if qe.indexed_count == 0:
-        log.error(
+        raise ValueError(
             "ChromaDB is empty. Run 'sovereign.py embed' first "
             "to index the SEC filings before comparing tickers."
         )
-        sys.exit(1)
 
     # -- 2. Fetch relevant chunks per ticker --
     log.info("Fetching up to %d chunks per ticker from ChromaDB...", n_chunks)
@@ -358,11 +351,7 @@ def compare_tickers(
     client = genai.Client(api_key=api_key)
 
     log.info("Calling Gemini (%s, temperature=0.2)...", model)
-    try:
-        _, parsed = _call_gemini(client, prompt, model)
-    except ValueError as exc:
-        log.error("Failed to parse Gemini response: %s", exc)
-        sys.exit(1)
+    _, parsed = _call_gemini(client, prompt, model)
 
     log.info(
         "Comparison complete — score=%s, shared_risks=%d",
@@ -419,10 +408,14 @@ if __name__ == "__main__":
     if len(args.tickers) < 2:
         parser.error("Provide at least two tickers for comparison.")
 
-    compare_tickers(
-        tickers=args.tickers,
-        theme=args.theme,
-        n_chunks=args.n,
-        model=args.model,
-        show=True,
-    )
+    try:
+        compare_tickers(
+            tickers=args.tickers,
+            theme=args.theme,
+            n_chunks=args.n,
+            model=args.model,
+            show=True,
+        )
+    except (ValueError, EnvironmentError) as exc:
+        log.error("%s", exc)
+        sys.exit(1)

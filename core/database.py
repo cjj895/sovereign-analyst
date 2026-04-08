@@ -152,7 +152,7 @@ class TransactionStore(_BaseStore):
     def get_by_ticker(self, ticker: str) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM transactions WHERE ticker = ? ORDER BY date ASC",
+                "SELECT * FROM transactions WHERE ticker = ? ORDER BY date ASC, id ASC",
                 (ticker.upper(),),
             ).fetchall()
         return [dict(r) for r in rows]
@@ -214,7 +214,7 @@ class TransactionStore(_BaseStore):
         """
         allowed = {
             "date", "type", "asset", "ticker",
-            "price", "quantity", "amount", "description",
+            "price", "quantity", "amount", "description", "ratio",
         }
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
@@ -260,8 +260,8 @@ class TransactionStore(_BaseStore):
 
         sql = """
         INSERT INTO transactions
-            (date, type, asset, ticker, price, quantity, amount, description)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (date, type, asset, ticker, price, quantity, amount, description, ratio)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         rows = [
             (
@@ -273,6 +273,7 @@ class TransactionStore(_BaseStore):
                 self._null(row.get("quantity")),
                 self._null(row.get("amount")),
                 self._null(row.get("description")),
+                self._null(row.get("ratio")),
             )
             for _, row in df.iterrows()
         ]
@@ -718,10 +719,12 @@ class AnalystNoteStore(_BaseStore):
     # ------------------------------------------------------------------ #
 
     def get_latest_note(self, ticker: str) -> dict[str, Any] | None:
-        """Return the most recently generated note for a ticker, or None."""
+        """Return the most recently generated analyst note (not a delta) for a ticker, or None."""
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM analyst_notes WHERE ticker = ? ORDER BY created_at DESC LIMIT 1",
+                "SELECT * FROM analyst_notes "
+                "WHERE ticker = ? AND delta_summary IS NULL "
+                "ORDER BY created_at DESC LIMIT 1",
                 (ticker.upper(),),
             ).fetchone()
         return dict(row) if row else None

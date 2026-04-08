@@ -155,6 +155,136 @@ def get_latest_note(ticker: str) -> dict[str, Any] | None:
         return None
 
 
+# ── transaction reads (for Portfolio Manager) ──────────────────────────────
+
+@st.cache_data(ttl=60)
+def get_all_transactions() -> pd.DataFrame:
+    """
+    Return all transactions as a DataFrame including the `id` column.
+    Sorted newest-first so the UI shows the latest entries at the top.
+    """
+    import sqlite3 as _sqlite3
+
+    try:
+        with _sqlite3.connect(_DB_PATH) as conn:
+            conn.row_factory = _sqlite3.Row
+            df = pd.read_sql_query(
+                "SELECT id, date, type, asset, ticker, price, quantity, "
+                "amount, description, ratio "
+                "FROM transactions ORDER BY date DESC, id DESC",
+                conn,
+            )
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+# ── transaction writes (non-cached — these mutate the DB) ──────────────────
+
+def write_transaction(
+    date_str: str,
+    tx_type: str,
+    ticker: str | None,
+    asset: str | None,
+    price: float | None,
+    quantity: float | None,
+    amount: float | None,
+    description: str | None,
+    ratio: float | None,
+) -> tuple[bool, str]:
+    """
+    Insert one transaction into sovereign.db.
+
+    Returns (success: bool, message: str).
+    Does NOT clear the Streamlit cache — callers must do that after a
+    successful write so the UI reflects the change.
+    """
+    store = TransactionStore(_DB_PATH)
+    try:
+        row_id = store.add_transaction(
+            date=date_str,
+            tx_type=tx_type,
+            asset=asset or None,
+            ticker=ticker.upper() if ticker else None,
+            price=price,
+            quantity=quantity,
+            amount=amount,
+            description=description or None,
+            ratio=ratio,
+        )
+        return True, f"Transaction saved (id={row_id})"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def delete_transaction_by_id(transaction_id: int) -> tuple[bool, str]:
+    """
+    Delete a transaction row by its primary key.
+
+    Returns (success: bool, message: str).
+    """
+    store = TransactionStore(_DB_PATH)
+    try:
+        removed = store.delete_transaction(transaction_id)
+        if removed:
+            return True, f"Transaction {transaction_id} deleted."
+        return False, f"No transaction found with id={transaction_id}."
+    except Exception as exc:
+        return False, str(exc)
+
+
+def bulk_import_from_df(df: pd.DataFrame) -> tuple[int, list[str]]:
+    """
+    Bulk-insert all rows from a pandas DataFrame into sovereign.db.
+
+    Accepts any CSV that has at minimum `date` and `type` columns.
+    All other columns are optional — missing numeric values are treated
+    as NULL.  Every row is attempted individually so one bad row does
+    not abort the entire import.
+
+    Returns (inserted_count, [error_strings]).
+    """
+    store = TransactionStore(_DB_PATH)
+    df = df.copy()
+    df.columns = df.columns.str.lower().str.strip()
+
+    required = {"date", "type"}
+    missing = required - set(df.columns)
+    if missing:
+        return 0, [f"CSV is missing required columns: {sorted(missing)}"]
+
+    success_count = 0
+    errors: list[str] = []
+
+    def _float_or_none(val: Any) -> float | None:
+        try:
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                return None
+            return float(val)
+        except (ValueError, TypeError):
+            return None
+
+    for idx, row in df.iterrows():
+        row_num = int(idx) + 2  # 1-indexed + header row
+        try:
+            store.add_transaction(
+                date=str(row.get("date", "")).strip(),
+                tx_type=str(row.get("type", "")).strip().lower(),
+                asset=str(row["asset"]).strip() if pd.notna(row.get("asset")) else None,
+                ticker=str(row["ticker"]).strip().upper() if pd.notna(row.get("ticker")) else None,
+                price=_float_or_none(row.get("price")),
+                quantity=_float_or_none(row.get("quantity")),
+                amount=_float_or_none(row.get("amount")),
+                description=str(row["description"]).strip() if pd.notna(row.get("description")) else None,
+                ratio=_float_or_none(row.get("ratio")),
+            )
+            success_count += 1
+        except Exception as exc:
+            errors.append(f"Row {row_num}: {exc}")
+
+    return success_count, errors
+
+
 # ── source-trace via ChromaDB ─────────────────────────────────────────────────
 
 @st.cache_data(ttl=600)

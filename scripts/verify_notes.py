@@ -211,17 +211,14 @@ def verify_note(
         notes = store.get_notes_for_ticker(ticker, limit=50)
         note = next((n for n in notes if n["id"] == note_id), None)
         if note is None:
-            log.error("No analyst note found for %s with id=%d.", ticker, note_id)
-            sys.exit(1)
+            raise ValueError(f"No analyst note found for {ticker} with id={note_id}.")
     else:
         note = store.get_latest_note(ticker)
         if note is None:
-            log.error(
-                "No analyst note found for %s. "
-                "Run scripts/generate_analyst_notes.py %s first.",
-                ticker, ticker,
+            raise ValueError(
+                f"No analyst note found for {ticker}. "
+                f"Run scripts/generate_analyst_notes.py {ticker} first."
             )
-            sys.exit(1)
 
     resolved_id = note["id"]
 
@@ -229,8 +226,9 @@ def verify_note(
     try:
         risks: list[str] = json.loads(note["risks"])
     except (json.JSONDecodeError, KeyError) as exc:
-        log.error("Failed to parse risks JSON for note id=%d: %s", resolved_id, exc)
-        sys.exit(1)
+        raise ValueError(
+            f"Failed to parse risks JSON for note id={resolved_id}: {exc}"
+        ) from exc
 
     if not risks:
         log.warning("Note id=%d has no risks to audit.", resolved_id)
@@ -242,11 +240,7 @@ def verify_note(
     )
 
     # -- Initialise QueryEngine --
-    try:
-        qe = QueryEngine()
-    except EnvironmentError as exc:
-        log.error("%s", exc)
-        sys.exit(1)
+    qe = QueryEngine()
 
     # -- Trace each claim --
     traces: list[dict[str, Any]] = []
@@ -299,4 +293,8 @@ if __name__ == "__main__":
         help="Write the computed confidence_score back to the analyst_notes table.",
     )
     args = parser.parse_args()
-    verify_note(ticker=args.ticker, note_id=args.note_id, save=args.save)
+    try:
+        verify_note(ticker=args.ticker, note_id=args.note_id, save=args.save)
+    except (ValueError, EnvironmentError) as exc:
+        log.error("%s", exc)
+        sys.exit(1)

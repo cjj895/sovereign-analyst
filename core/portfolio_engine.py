@@ -34,7 +34,6 @@ class PortfolioManager:
         split    - multiplies current qty by ratio, divides avg_cost by ratio
     """
 
-    INVESTMENT_TYPES: frozenset[str] = frozenset({"buy", "sell", "dividend", "split"})
     CACHE_TTL_SECONDS: int = 900  # 15 minutes
 
     def __init__(
@@ -176,7 +175,7 @@ class PortfolioManager:
 
     def _load_price_cache(self) -> dict:
         try: return json.loads(self.config.cache_file.read_text())
-        except: return {}
+        except Exception: return {}
 
     def _save_price_cache(self, cache: dict):
         self.config.cache_file.write_text(json.dumps(cache, indent=2))
@@ -196,7 +195,7 @@ class PortfolioManager:
                     cache[t] = {"price": p, "fetched_at": datetime.now().isoformat()}
                     prices.append(p)
                     updated = True
-                except:
+                except Exception:
                     prices.append(entry.get("price"))
         if updated: self._save_price_cache(cache)
         return prices

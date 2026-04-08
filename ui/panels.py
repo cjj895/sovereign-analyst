@@ -13,6 +13,7 @@ render_source_trace:
 """
 from __future__ import annotations
 
+import html
 import json
 from typing import Any
 
@@ -100,7 +101,7 @@ def render_delta_diff(delta_note: dict[str, Any] | None) -> None:
     )
     if added:
         html_blocks = "".join(
-            _card(f"+ &nbsp;{item}", _GREEN_BG, _GREEN_FG)
+            _card(f"+ &nbsp;{html.escape(str(item))}", _GREEN_BG, _GREEN_FG)
             for item in added
         )
         st.markdown(html_blocks, unsafe_allow_html=True)
@@ -123,7 +124,7 @@ def render_delta_diff(delta_note: dict[str, Any] | None) -> None:
         html_blocks = "".join(
             _card(
                 f"<span style='text-decoration:line-through; color:{_RED_FG};'>"
-                f"− &nbsp;{item}</span>",
+                f"− &nbsp;{html.escape(str(item))}</span>",
                 _RED_BG,
                 _RED_FG,
             )
@@ -147,8 +148,8 @@ def render_delta_diff(delta_note: dict[str, Any] | None) -> None:
     )
     if softened:
         for item in softened:
-            original       = item.get("original",       "")
-            revised        = item.get("revised",        "")
+            original       = html.escape(str(item.get("original",       "")))
+            revised        = html.escape(str(item.get("revised",        "")))
             interpretation = item.get("interpretation", "")
             left_col, right_col = st.columns(2)
             with left_col:
@@ -231,7 +232,7 @@ def render_source_trace(traces: list[dict[str, Any]]) -> None:
                 f'border-radius:4px; padding:10px 14px; margin-top:8px; '
                 f'font-size:0.82rem; font-family:monospace; line-height:1.6; '
                 f'color:#c9d1d9; white-space:pre-wrap;">'
-                f'{chunk}'
+                f'{html.escape(str(chunk))}'
                 f'</div>',
                 unsafe_allow_html=True,
             )

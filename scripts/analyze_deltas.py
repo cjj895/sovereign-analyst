@@ -405,18 +405,13 @@ def run_delta(
     load_dotenv()
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        log.error("GEMINI_API_KEY not set in .env — aborting.")
-        sys.exit(1)
+        raise EnvironmentError("GEMINI_API_KEY not set in .env")
 
     ticker = ticker.upper()
     log.info("Surgical Delta for %s using %s", ticker, model)
 
     # -- 1. Select filings --
-    try:
-        rec_new, rec_old = _pick_filings(ticker, year_new, year_old)
-    except ValueError as exc:
-        log.error("%s", exc)
-        sys.exit(1)
+    rec_new, rec_old = _pick_filings(ticker, year_new, year_old)
 
     period_new = rec_new.get("period_of_report", "unknown")
     period_old = rec_old.get("period_of_report", "unknown")
@@ -424,12 +419,8 @@ def run_delta(
     log.info("OLD filing: %s  (%s)", rec_old["accession_number"], period_old)
 
     # -- 2. Load Item 1A text --
-    try:
-        text_new = _load_risk_text(rec_new)
-        text_old = _load_risk_text(rec_old)
-    except FileNotFoundError as exc:
-        log.error("%s", exc)
-        sys.exit(1)
+    text_new = _load_risk_text(rec_new)
+    text_old = _load_risk_text(rec_old)
 
     log.info(
         "Loaded risk text — new: %d chars, old: %d chars",
@@ -441,11 +432,7 @@ def run_delta(
     log.info("Calling Gemini API (temperature=0.1)...")
 
     client = genai.Client(api_key=api_key)
-    try:
-        raw_response, parsed = _call_gemini(client, prompt, model)
-    except ValueError as exc:
-        log.error("Failed to parse Gemini response: %s", exc)
-        sys.exit(1)
+    raw_response, parsed = _call_gemini(client, prompt, model)
 
     log.info(
         "Delta parsed — added=%d, removed=%d, softened=%d",
@@ -512,10 +499,14 @@ if __name__ == "__main__":
         help="Print the delta report to stdout after saving.",
     )
     args = parser.parse_args()
-    run_delta(
-        ticker=args.ticker,
-        year_new=args.year_new,
-        year_old=args.year_old,
-        model=args.model,
-        show=args.show,
-    )
+    try:
+        run_delta(
+            ticker=args.ticker,
+            year_new=args.year_new,
+            year_old=args.year_old,
+            model=args.model,
+            show=args.show,
+        )
+    except (ValueError, FileNotFoundError, EnvironmentError) as exc:
+        log.error("%s", exc)
+        sys.exit(1)
