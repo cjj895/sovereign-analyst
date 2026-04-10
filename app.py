@@ -25,6 +25,10 @@ from typing import Any
 
 import pandas as pd
 import streamlit as st
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # ── project root on sys.path so relative imports work when Streamlit cwd varies
 _ROOT = Path(__file__).resolve().parent
