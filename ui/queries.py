@@ -18,6 +18,7 @@ TTL guide
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+from fpdf import FPDF
 
 # ── project root ──────────────────────────────────────────────────────────────
 _ROOT = Path(__file__).resolve().parents[1]
@@ -358,3 +360,63 @@ def get_chroma_trace(risks_json: str, ticker: str) -> list[dict[str, Any]]:
         })
 
     return results
+
+
+# ── System Maintenance Wrappers ───────────────────────────────────────────────
+
+def sync_sec_filings() -> bool:
+    """Triggers scripts/fetch_filings.py for all portfolio tickers."""
+    tickers = get_tickers()
+    if not tickers:
+        st.error("No tickers found in portfolio.")
+        return False
+
+    # Joining tickers into a comma-separated string for the script argument
+    ticker_str = ",".join(tickers)
+    cmd = [sys.executable, "scripts/fetch_filings.py", "--tickers", ticker_str]
+
+    try:
+        # Using subprocess to run the script in a separate process
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        st.error(f"Sync failed: {e.stderr}")
+        return False
+
+
+def update_vector_index() -> bool:
+    """Sequentially runs preprocessing and embedding."""
+    try:
+        # 1. Preprocess
+        subprocess.run([sys.executable, "scripts/preprocess_filings.py"], check=True, capture_output=True)
+        # 2. Embed (Assuming core/embed_engine.py exists or similar)
+        # Looking at the file structure from project-core.mdc, it mentions core/portfolio_engine.py
+        # but the user query mentioned core/embed_engine.py. I will use what the user asked.
+        subprocess.run([sys.executable, "core/embed_engine.py"], check=True, capture_output=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        st.error(f"Indexing failed: {e.stderr}")
+        return False
+
+
+def generate_pdf_memo(ticker: str, price: float, pnl: float, analysis_text: str) -> bytes:
+    """Compiles the investment memo using fpdf2."""
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, f"Investment Memo: {ticker}", ln=True, align='C')
+
+    pdf.set_font("Helvetica", "", 12)
+    pdf.ln(10)
+    pdf.cell(0, 10, f"Current Price: ${price:,.2f}", ln=True)
+    pdf.cell(0, 10, f"Portfolio P&L: {pnl:+.2f}%", ln=True)
+
+    pdf.ln(10)
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 10, "Surgical Delta Verdict:", ln=True)
+    pdf.set_font("Helvetica", "", 11)
+    pdf.multi_cell(0, 8, analysis_text)
+
+    # Return as bytes for Streamlit download button
+    return pdf.output()
+

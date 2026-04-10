@@ -46,6 +46,9 @@ from ui.queries import (
     get_portfolio,
     get_tickers,
     write_transaction,
+    sync_sec_filings,
+    update_vector_index,
+    generate_pdf_memo,
 )
 
 # ── page config ───────────────────────────────────────────────────────────────
@@ -160,6 +163,31 @@ with st.sidebar:
     st.caption("SQLite + ChromaDB · Local-first")
     st.caption("DB: `data/sovereign.db`")
 
+    st.divider()
+    import os
+    if not os.getenv("GEMINI_API_KEY"):
+        st.error("🔑 Gemini API Key missing! AI features will not work. Check your .env file.")
+
+    st.subheader("⚙️ System Maintenance")
+
+    col1, col2 = st.columns(2)
+
+    if col1.button("📥 Sync SEC", help="Fetch latest 10-Ks for portfolio", use_container_width=True):
+        with st.spinner("Syncing EDGAR..."):
+            if sync_sec_filings():
+                st.toast("SEC Filings Synced!", icon="✅")
+
+    if col2.button("🧠 Index AI", help="Re-build vector search index", use_container_width=True):
+        with st.spinner("Re-indexing..."):
+            if update_vector_index():
+                st.toast("AI Index Updated!", icon="🚀")
+
+    if st.button("⚖️ Validate ACB Integrity", help="Run portfolio accounting checks", use_container_width=True):
+        from core.portfolio_engine import PortfolioEngine
+        with st.spinner("Validating..."):
+            PortfolioEngine().run_validations()
+            st.toast("Portfolio Integrity Verified", icon="✅")
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  DATA LOADING  (runs once per session / TTL window)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -257,6 +285,9 @@ with tab1:
         st.subheader("Current Holdings")
 
         if holdings_df is not None and not holdings_df.empty:
+            if holdings_df["current_price"].isnull().any():
+                st.warning("⚠️ Some market prices could not be refreshed. Showing last known values.")
+
             _display_cols = [
                 col for col in [
                     "asset", "quantity", "avg_cost", "capital_invested",
@@ -374,23 +405,91 @@ with tab3:
             render_delta_diff(latest_delta_dict)
 
             st.markdown("---")
+                        # --- New Ticker-Specific Controls ---
+            st.markdown("#### Data Pipeline Controls")
+            p_col1, p_col2 = st.columns(2)
+            
+            if p_col1.button(f"📥 Fetch {ticker} Filings", use_container_width=True):
+                from scripts.fetch_filings import fetch_filings_for_ticker, get_user_agent, load_environment
+                from core.database import FilingMetadataStore
+                load_environment()
+                with st.spinner(f"Fetching {ticker}..."):
+                    fetch_filings_for_ticker(ticker, get_user_agent(), FilingMetadataStore())
+                    st.success(f"Filings for {ticker} downloaded.")
+
+            if p_col2.button(f"🧹 Preprocess {ticker}", use_container_width=True):
+                from scripts.preprocess_filings import process_all_for_ticker
+                from core.database import ProcessedFilingStore
+                with st.spinner(f"Cleaning {ticker}..."):
+                    process_all_for_ticker(ticker, ProcessedFilingStore())
+                    st.success(f"Sections extracted for {ticker}.")
             if st.button(
                 f"⚡ Generate New Delta Analysis for {ticker}",
                 type="primary",
                 use_container_width=True,
                 help="Calls the Gemini API — uses token budget.",
             ):
-                with st.spinner(f"Calling Gemini (temperature=0.1) for {ticker}..."):
+                with st.status(f"Orchestrating data for {ticker}...", expanded=True) as status:
                     try:
+                        # 1. AUTO-FETCH (Ensure we have at least 2 10-Ks)
+                        from scripts.fetch_filings import fetch_filings_for_ticker, get_user_agent, load_environment
+                        from core.database import FilingMetadataStore, ProcessedFilingStore
+                        from scripts.preprocess_filings import process_filing
+                        
+                        load_environment()
+
+                        fm_store = FilingMetadataStore()
+                        user_agent = get_user_agent()
+                        
+                        st.write("Checking SEC for latest 10-Ks...")
+                        # Fetch 2 annual filings to ensure we have enough for delta analysis
+                        fetch_results = fetch_filings_for_ticker(
+                            ticker, user_agent, fm_store, n_annual=2, n_quarterly=0
+                        )
+                        
+                        # 2. AUTO-PREPROCESS
+                        st.write("Cleaning and sectioning filings...")
+                        pf_store = ProcessedFilingStore()
+                        
+                        # Process the filings we just downloaded (or already had)
+                        for form_type, paths in fetch_results.items():
+                            for path in paths:
+                                if path and path.exists():
+                                    process_filing(path, pf_store)
+
+                        # 3. RUN ANALYSIS
+                        st.write("Running AI Delta Analysis...")
                         from scripts.analyze_deltas import run_delta
                         _new_id = run_delta(ticker)
+                        
+                        status.update(label=f"Delta analysis complete (id={_new_id})", state="complete", expanded=False)
                         st.success(f"Delta saved (id={_new_id}). Refreshing data...")
                         st.cache_data.clear()
                         st.rerun()
                     except (ValueError, FileNotFoundError, EnvironmentError) as exc:
+                        status.update(label="Delta generation failed", state="error")
                         st.error(f"Delta generation failed: {exc}")
                     except Exception as exc:
+                        status.update(label="Unexpected error", state="error")
                         st.error(f"Unexpected error: {exc}")
+
+            if latest_delta_dict:
+                st.markdown("---")
+                # PDF Export Button
+                pdf_bytes = generate_pdf_memo(
+                    ticker=ticker,
+                    price=holdings_df[holdings_df["asset"] == ticker]["current_price"].iloc[0] if not holdings_df.empty and ticker in holdings_df["asset"].values else 0.0,
+                    pnl=unrealised_pct,
+                    analysis_text=latest_delta_dict.get("summary", "No analysis available.")
+                )
+                
+                st.download_button(
+                    label="📄 Export Investment Memo",
+                    data=pdf_bytes,
+                    file_name=f"Sovereign_Memo_{ticker}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True
+                )
 
         with trace_col:
             st.subheader("Source-Trace Audit")
@@ -414,6 +513,13 @@ with tab3:
                     st.info("The latest note has no extracted risk claims.")
             else:
                 st.info(f"No analyst note found for **{ticker}**.")
+            
+            st.markdown("---")
+            if st.button(f"🧠 Refresh AI Index for {ticker}", use_container_width=True):
+                from ui.queries import update_vector_index
+                with st.spinner("Updating ChromaDB..."):
+                    update_vector_index(ticker_filter=ticker)
+                    st.toast(f"AI Index for {ticker} updated!", icon="🚀")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  TAB 4 — AUDIT TRAIL
